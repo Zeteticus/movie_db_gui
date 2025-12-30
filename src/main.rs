@@ -9,7 +9,7 @@
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box, Button, Entry, Label, ListBox, ScrolledWindow, 
           Orientation, SearchEntry, DropDown, Grid, Frame, Separator, StringList, Window, Picture, 
-          Align, CheckButton};
+          Align};
 use gtk::gdk_pixbuf::Pixbuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -180,6 +180,98 @@ fn download_poster(poster_url: &str, movie_id: u32) -> Option<String> {
     std::io::copy(&mut bytes.as_ref(), &mut file).ok()?;
     
     Some(poster_path)
+}
+
+// Async function to fetch metadata for a single movie (non-blocking)
+async fn fetch_movie_metadata_async(
+    client: &reqwest::Client,
+    api_key: &str,
+    title: &str,
+    file_path: String,
+) -> Option<Movie> {
+    let search_url = format!(
+        "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+        api_key,
+        urlencoding::encode(title)
+    );
+    
+    let search_response = client
+        .get(&search_url)
+        .send()
+        .await
+        .ok()?
+        .json::<TMDBSearchResponse>()
+        .await
+        .ok()?;
+    
+    if search_response.results.is_empty() {
+        return None;
+    }
+    
+    let movie_id = search_response.results[0].id;
+    
+    let details_url = format!(
+        "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
+        movie_id, api_key
+    );
+    
+    let details = client
+        .get(&details_url)
+        .send()
+        .await
+        .ok()?
+        .json::<TMDBMovieDetails>()
+        .await
+        .ok()?;
+    
+    let year: u16 = details.release_date
+        .split('-')
+        .next()
+        .and_then(|y| y.parse().ok())
+        .unwrap_or(0);
+    
+    let director = details.credits.crew
+        .iter()
+        .find(|c| c.job == "Director")
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+    
+    let cast: Vec<String> = details.credits.cast
+        .iter()
+        .take(5)
+        .map(|c| c.name.clone())
+        .collect();
+    
+    let genres: Vec<String> = details.genres
+        .iter()
+        .map(|g| g.name.clone())
+        .collect();
+    
+    let poster_url = details.poster_path
+        .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+        .unwrap_or_default();
+    
+    let poster_path = if !poster_url.is_empty() {
+        download_poster(&poster_url, movie_id).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    
+    Some(Movie {
+        id: 0,
+        title: details.title,
+        year,
+        director,
+        genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
+        rating: details.vote_average,
+        runtime: details.runtime.unwrap_or(0),
+        description: details.overview,
+        cast,
+        file_path,
+        poster_url,
+        tmdb_id: movie_id,
+        poster_path,
+    })
 }
 
 impl MovieDatabase {
@@ -373,10 +465,10 @@ fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
     ok_btn.connect_clicked(move |_| {
         let key = api_entry.text().to_string();
         if !key.is_empty() {
-            // Save the API key to config
-            let config = Config {
-                tmdb_api_key: key.clone(),
-            };
+            // Save the API key to config, preserving existing settings
+            let mut config = load_config().unwrap_or_default();
+            config.tmdb_api_key = key.clone();
+            
             if let Err(e) = save_config(&config) {
                 eprintln!("Warning: Could not save config: {}", e);
             } else {
@@ -398,6 +490,42 @@ fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
         None
     } else {
         Some(key)
+    }
+}
+
+// Helper function to recursively scan directories for video files
+fn scan_directory_recursive(
+    dir: &Path,
+    video_extensions: &[&str],
+    files: &mut Vec<(String, String)>,
+) {
+    if let Ok(entries) = read_dir(dir) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            
+            if entry_path.is_dir() {
+                // Recursively scan subdirectories
+                scan_directory_recursive(&entry_path, video_extensions, files);
+            } else if entry_path.is_file() {
+                if let Some(ext) = entry_path.extension() {
+                    let ext_str = ext.to_string_lossy().to_lowercase();
+                    if video_extensions.contains(&ext_str.as_str()) {
+                        if let Some(file_name) = entry_path.file_stem() {
+                            let title = file_name.to_string_lossy().to_string();
+                            let file_path_str = entry_path.to_string_lossy().to_string();
+                            
+                            let clean_title = title
+                                .replace('.', " ")
+                                .replace('_', " ")
+                                .trim()
+                                .to_string();
+                            
+                            files.push((clean_title, file_path_str));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -538,124 +666,106 @@ fn build_ui(app: &Application) {
         let db_clone = db.clone();
         let list_box_clone = list_box.clone();
         let status_bar_clone = status_bar.clone();
-        let api_key = db_clone.borrow().tmdb_api_key.clone();
+        let window_clone = window.clone();
+        
+        // Ask user if they want to scan
+        let dialog = gtk::AlertDialog::builder()
+            .message("Auto-Scan")
+            .detail(&format!(
+                "Found {} configured director{}.\n\nWould you like to scan for new movies?",
+                config.scan_directories.len(),
+                if config.scan_directories.len() == 1 { "y" } else { "ies" }
+            ))
+            .buttons(vec!["Skip", "Scan Now"])
+            .cancel_button(0)
+            .default_button(1)
+            .build();
+        
         let scan_dirs = config.scan_directories.clone();
+        let api_key = db_clone.borrow().tmdb_api_key.clone();
         
-        status_bar_clone.set_text("Auto-scanning configured directories...");
-        
-        // Spawn auto-scan in background
-        let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
-        
-        std::thread::spawn(move || {
-            for scan_dir in &scan_dirs {
-                let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {}", scan_dir), None));
+        dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
+            if let Ok(1) = response {
+                // User chose "Scan Now"
+                status_bar_clone.set_text("Auto-scanning configured directories...");
                 
-                let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                // Spawn auto-scan in background
+                let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
                 
-                if let Ok(entries) = read_dir(scan_dir) {
-                    for entry in entries.flatten() {
-                        let entry_path = entry.path();
-                        if entry_path.is_file() {
-                            if let Some(ext) = entry_path.extension() {
-                                let ext_str = ext.to_string_lossy().to_lowercase();
-                                if video_extensions.contains(&ext_str.as_str()) {
-                                    if let Some(file_name) = entry_path.file_stem() {
-                                        let title = file_name.to_string_lossy().to_string();
-                                        let file_path_str = entry_path.to_string_lossy().to_string();
+                let api_key_clone = api_key.clone();
+                let scan_dirs_clone = scan_dirs.clone();
+                std::thread::spawn(move || {
+                    // Use tokio runtime for async operations
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    
+                    runtime.block_on(async {
+                        // Collect all video files first (recursively)
+                        let mut files_to_process = Vec::new();
+                        let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                        
+                        for scan_dir in &scan_dirs_clone {
+                            let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {} (including subdirectories)...", scan_dir), None));
+                            
+                            let path = Path::new(scan_dir);
+                            scan_directory_recursive(path, &video_extensions, &mut files_to_process);
+                        }
+                        
+                        let _ = sender.send_blocking(("status".to_string(), format!("Found {} video files, fetching metadata in parallel...", files_to_process.len()), None));
+                        
+                        // Process files in parallel batches of 10
+                        let client = reqwest::Client::new();
+                        let batch_size = 10;
+                        
+                        for batch in files_to_process.chunks(batch_size) {
+                            let futures: Vec<_> = batch.iter()
+                                .map(|(clean_title, file_path_str)| {
+                                    let api_key = api_key_clone.clone();
+                                    let title = clean_title.clone();
+                                    let file_path = file_path_str.clone();
+                                    let client = client.clone();
+                                    let sender = sender.clone();
+                                    
+                                    async move {
+                                        let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                         
-                                        let clean_title = title
-                                            .replace('.', " ")
-                                            .replace('_', " ")
-                                            .trim()
-                                            .to_string();
-                                        
-                                        let _ = sender.send_blocking(("status".to_string(), format!("Checking: {}", clean_title), None));
-                                        
-                                        // Fetch metadata
-                                        let client = reqwest::blocking::Client::new();
-                                        let search_url = format!(
-                                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-                                            api_key,
-                                            urlencoding::encode(&clean_title)
-                                        );
-                                        
-                                        if let Ok(response) = client.get(&search_url).send() {
-                                            if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
-                                                if !search_response.results.is_empty() {
-                                                    let movie_id = search_response.results[0].id;
-                                                    let details_url = format!(
-                                                        "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
-                                                        movie_id, api_key
-                                                    );
-                                                    
-                                                    if let Ok(details_response) = client.get(&details_url).send() {
-                                                        if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
-                                                            let year: u16 = details.release_date
-                                                                .split('-')
-                                                                .next()
-                                                                .and_then(|y| y.parse().ok())
-                                                                .unwrap_or(0);
-                                                            
-                                                            let director = details.credits.crew
-                                                                .iter()
-                                                                .find(|c| c.job == "Director")
-                                                                .map(|c| c.name.clone())
-                                                                .unwrap_or_else(|| "Unknown".to_string());
-                                                            
-                                                            let cast: Vec<String> = details.credits.cast
-                                                                .iter()
-                                                                .take(5)
-                                                                .map(|c| c.name.clone())
-                                                                .collect();
-                                                            
-                                                            let genres: Vec<String> = details.genres
-                                                                .iter()
-                                                                .map(|g| g.name.clone())
-                                                                .collect();
-                                                            
-                                                            let poster_url = details.poster_path
-                                                                .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
-                                                                .unwrap_or_default();
-                                                            
-                                                            let poster_path = if !poster_url.is_empty() {
-                                                                download_poster(&poster_url, movie_id).unwrap_or_default()
-                                                            } else {
-                                                                String::new()
-                                                            };
-                                                            
-                                                            let movie = Movie {
-                                                                id: 0,
-                                                                title: details.title,
-                                                                year,
-                                                                director,
-                                                                genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
-                                                                rating: details.vote_average,
-                                                                runtime: details.runtime.unwrap_or(0),
-                                                                description: details.overview,
-                                                                cast,
-                                                                file_path: file_path_str,
-                                                                poster_url,
-                                                                tmdb_id: movie_id,
-                                                                poster_path,
-                                                            };
-                                                            
-                                                            let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", clean_title), Some(movie)));
-                                                            continue;
-                                                        }
-                                                    }
-                                                }
+                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone()).await {
+                                            Some(movie) => {
+                                                let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
+                                            }
+                                            None => {
+                                                // Create basic entry without metadata
+                                                let movie = Movie {
+                                                    id: 0,
+                                                    title: title.clone(),
+                                                    year: 0,
+                                                    director: String::from("Unknown"),
+                                                    genre: vec![String::from("Uncategorized")],
+                                                    rating: 0.0,
+                                                    runtime: 0,
+                                                    description: String::from("Metadata not found"),
+                                                    cast: vec![],
+                                                    file_path,
+                                                    poster_url: String::new(),
+                                                    tmdb_id: 0,
+                                                    poster_path: String::new(),
+                                                };
+                                                let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
                                             }
                                         }
                                     }
-                                }
-                            }
+                                })
+                                .collect();
+                            
+                            // Wait for this batch to complete
+                            futures::future::join_all(futures).await;
                         }
-                    }
-                }
-            }
-            
-            let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
-        });
+                        
+                        let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                    });
+                });
         
         // Handle messages on main thread
         glib::spawn_future_local(async move {
@@ -693,6 +803,11 @@ fn build_ui(app: &Application) {
                     _ => {}
                 }
             }
+        });
+        } else {
+            // User chose "Skip"
+            status_bar_clone.set_text("Auto-scan skipped");
+        }
         });
     }
 
@@ -906,131 +1021,73 @@ fn build_ui(app: &Application) {
                     // Get API key before spawning thread
                     let api_key = db_clone3.borrow().tmdb_api_key.clone();
                     
-                    // Spawn background thread
+                    // Spawn background thread with async runtime
                     std::thread::spawn(move || {
-                        let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
                         
-                        if let Ok(entries) = read_dir(&path_str) {
-                            for entry in entries.flatten() {
-                                let entry_path = entry.path();
-                                if entry_path.is_file() {
-                                    if let Some(ext) = entry_path.extension() {
-                                        let ext_str = ext.to_string_lossy().to_lowercase();
-                                        if video_extensions.contains(&ext_str.as_str()) {
-                                            if let Some(file_name) = entry_path.file_stem() {
-                                                let title = file_name.to_string_lossy().to_string();
-                                                let file_path_str = entry_path.to_string_lossy().to_string();
-                                                
-                                                let clean_title = title
-                                                    .replace('.', " ")
-                                                    .replace('_', " ")
-                                                    .trim()
-                                                    .to_string();
-                                                
-                                                let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", clean_title), None));
-                                                
-                                                // Fetch metadata in background thread
-                                                let client = reqwest::blocking::Client::new();
-                                                let search_url = format!(
-                                                    "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-                                                    api_key,
-                                                    urlencoding::encode(&clean_title)
-                                                );
-                                                
-                                                if let Ok(response) = client.get(&search_url).send() {
-                                                    if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
-                                                        if !search_response.results.is_empty() {
-                                                            let movie_id = search_response.results[0].id;
-                                                            let details_url = format!(
-                                                                "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
-                                                                movie_id, api_key
-                                                            );
-                                                            
-                                                            if let Ok(details_response) = client.get(&details_url).send() {
-                                                                if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
-                                                                    let year: u16 = details.release_date
-                                                                        .split('-')
-                                                                        .next()
-                                                                        .and_then(|y| y.parse().ok())
-                                                                        .unwrap_or(0);
-                                                                    
-                                                                    let director = details.credits.crew
-                                                                        .iter()
-                                                                        .find(|c| c.job == "Director")
-                                                                        .map(|c| c.name.clone())
-                                                                        .unwrap_or_else(|| "Unknown".to_string());
-                                                                    
-                                                                    let cast: Vec<String> = details.credits.cast
-                                                                        .iter()
-                                                                        .take(5)
-                                                                        .map(|c| c.name.clone())
-                                                                        .collect();
-                                                                    
-                                                                    let genres: Vec<String> = details.genres
-                                                                        .iter()
-                                                                        .map(|g| g.name.clone())
-                                                                        .collect();
-                                                                    
-                                                                    let poster_url = details.poster_path
-                                                                        .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
-                                                                        .unwrap_or_default();
-                                                                    
-                                                                    // Download poster (we'll use a temporary ID 0 for now)
-                                                                    let poster_path = if !poster_url.is_empty() {
-                                                                        download_poster(&poster_url, movie_id).unwrap_or_default()
-                                                                    } else {
-                                                                        String::new()
-                                                                    };
-                                                                    
-                                                                    let movie = Movie {
-                                                                        id: 0,
-                                                                        title: details.title,
-                                                                        year,
-                                                                        director,
-                                                                        genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
-                                                                        rating: details.vote_average,
-                                                                        runtime: details.runtime.unwrap_or(0),
-                                                                        description: details.overview,
-                                                                        cast,
-                                                                        file_path: file_path_str,
-                                                                        poster_url,
-                                                                        tmdb_id: movie_id,
-                                                                        poster_path,
-                                                                    };
-                                                                    
-                                                                    let _ = sender.send_blocking(("add".to_string(), format!("✓ Added: {}", clean_title), Some(movie)));
-                                                                    continue;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                        runtime.block_on(async {
+                            // Collect all video files recursively
+                            let mut files_to_process = Vec::new();
+                            let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                            
+                            let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {} (including subdirectories)...", path_str), None));
+                            
+                            let path = Path::new(&path_str);
+                            scan_directory_recursive(path, &video_extensions, &mut files_to_process);
+                            
+                            let _ = sender.send_blocking(("status".to_string(), format!("Found {} video files, fetching metadata in parallel...", files_to_process.len()), None));
+                            
+                            // Process files in parallel batches of 10
+                            let client = reqwest::Client::new();
+                            let batch_size = 10;
+                            
+                            for batch in files_to_process.chunks(batch_size) {
+                                let futures: Vec<_> = batch.iter()
+                                    .map(|(clean_title, file_path_str)| {
+                                        let api_key = api_key.clone();
+                                        let title = clean_title.clone();
+                                        let file_path = file_path_str.clone();
+                                        let client = client.clone();
+                                        let sender = sender.clone();
+                                        
+                                        async move {
+                                            let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
+                                            
+                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone()).await {
+                                                Some(movie) => {
+                                                    let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                                 }
-                                                
-                                                // If we get here, metadata fetch failed
-                                                let movie = Movie {
-                                                    id: 0,
-                                                    title: clean_title.clone(),
-                                                    year: 0,
-                                                    director: String::from("Unknown"),
-                                                    genre: vec![String::from("Uncategorized")],
-                                                    rating: 0.0,
-                                                    runtime: 0,
-                                                    description: String::from("Metadata not found"),
-                                                    cast: vec![],
-                                                    file_path: file_path_str,
-                                                    poster_url: String::new(),
-                                                    tmdb_id: 0,
-                                                    poster_path: String::new(),
-                                                };
-                                                let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", clean_title), Some(movie)));
+                                                None => {
+                                                    let movie = Movie {
+                                                        id: 0,
+                                                        title: title.clone(),
+                                                        year: 0,
+                                                        director: String::from("Unknown"),
+                                                        genre: vec![String::from("Uncategorized")],
+                                                        rating: 0.0,
+                                                        runtime: 0,
+                                                        description: String::from("Metadata not found"),
+                                                        cast: vec![],
+                                                        file_path,
+                                                        poster_url: String::new(),
+                                                        tmdb_id: 0,
+                                                        poster_path: String::new(),
+                                                    };
+                                                    let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
+                                                }
                                             }
                                         }
-                                    }
-                                }
+                                    })
+                                    .collect();
+                                
+                                futures::future::join_all(futures).await;
                             }
-                        }
-                        
-                        let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                            
+                            let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                        });
                     });
                     
                     // Handle messages on main thread using spawn_future_local
