@@ -1046,16 +1046,21 @@ fn build_ui(app: &Application) {
                 if movie.cast_details.is_empty() {
                     let dialog = gtk::AlertDialog::builder()
                         .message("No Cast Information")
-                        .detail("Cast information is not available for this movie.")
+                        .detail("Cast photos are not available for this movie yet.\n\nTo get cast information:\n1. Click the \"🔄 Refresh Metadata\" button\n2. Wait for the update to complete\n3. Click \"⭐ Show Cast\" again\n\nNote: Cast photos are only available for movies scanned after the latest update.")
                         .buttons(vec!["OK"])
                         .build();
                     dialog.show(Some(&window_clone));
                     return;
                 }
 
+                // Clone the cast details for background thread
+                let cast_details = movie.cast_details.clone();
+                let cast_details_for_ui = cast_details.clone(); // Clone for UI thread
+                let movie_title = movie.title.clone();
+
                 // Create cast dialog
                 let cast_dialog = Window::builder()
-                    .title(&format!("Cast of {}", movie.title))
+                    .title(&format!("Cast of {}", movie_title))
                     .modal(true)
                     .transient_for(&window_clone)
                     .default_width(600)
@@ -1071,20 +1076,64 @@ fn build_ui(app: &Application) {
                 cast_box.set_margin_top(20);
                 cast_box.set_margin_bottom(20);
 
-                for cast_member in &movie.cast_details {
-                    let member_box = Box::new(Orientation::Horizontal, 12);
-                    member_box.set_margin_bottom(12);
+                // Show dialog immediately with loading message
+                let loading_label = Label::new(Some("Loading cast photos..."));
+                cast_box.append(&loading_label);
+                scroll.set_child(Some(&cast_box));
+                cast_dialog.set_child(Some(&scroll));
+                cast_dialog.present();
 
-                    // Actor photo
-                    let photo_box = Box::new(Orientation::Vertical, 0);
-                    photo_box.set_size_request(120, 180);
+                // Download photos in background thread
+                let (sender, receiver) = async_channel::unbounded::<(String, String, String, Vec<u8>)>();
+                
+                std::thread::spawn(move || {
+                    for cast_member in &cast_details {
+                        if !cast_member.profile_path.is_empty() {
+                            if let Ok(response) = reqwest::blocking::get(&cast_member.profile_path) {
+                                if let Ok(bytes) = response.bytes() {
+                                    let _ = sender.send_blocking((
+                                        cast_member.name.clone(),
+                                        cast_member.character.clone(),
+                                        cast_member.profile_path.clone(),
+                                        bytes.to_vec()
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                        // Send with empty bytes if no photo
+                        let _ = sender.send_blocking((
+                            cast_member.name.clone(),
+                            cast_member.character.clone(),
+                            String::new(),
+                            vec![]
+                        ));
+                    }
+                });
+
+                // Update UI as photos arrive
+                let cast_box_clone = cast_box.clone();
+                glib::spawn_future_local(async move {
+                    // Remove loading message
+                    while let Some(child) = cast_box_clone.first_child() {
+                        cast_box_clone.remove(&child);
+                    }
+
+                    let mut count = 0;
+                    let total = cast_details_for_ui.len();
                     
-                    if !cast_member.profile_path.is_empty() {
-                        // Try to load photo from URL
-                        if let Ok(response) = reqwest::blocking::get(&cast_member.profile_path) {
-                            if let Ok(bytes) = response.bytes() {
+                    while count < total {
+                        if let Ok((name, character, _profile_path, photo_bytes)) = receiver.recv().await {
+                            let member_box = Box::new(Orientation::Horizontal, 12);
+                            member_box.set_margin_bottom(12);
+
+                            // Actor photo
+                            let photo_box = Box::new(Orientation::Vertical, 0);
+                            photo_box.set_size_request(120, 180);
+                            
+                            if !photo_bytes.is_empty() {
                                 let loader = gtk::gdk_pixbuf::PixbufLoader::new();
-                                let _ = loader.write(&bytes);
+                                let _ = loader.write(&photo_bytes);
                                 let _ = loader.close();
                                 if let Some(pixbuf) = loader.pixbuf() {
                                     if let Some(scaled_pixbuf) = pixbuf.scale_simple(120, 180, gtk::gdk_pixbuf::InterpType::Bilinear) {
@@ -1092,42 +1141,40 @@ fn build_ui(app: &Application) {
                                         photo_box.append(&picture);
                                     }
                                 }
+                            } else {
+                                // Placeholder
+                                let placeholder = Label::new(Some("👤"));
+                                placeholder.set_markup("<span size='xx-large'>👤</span>");
+                                photo_box.append(&placeholder);
                             }
+
+                            member_box.append(&photo_box);
+
+                            // Actor info
+                            let info_box = Box::new(Orientation::Vertical, 4);
+                            info_box.set_valign(Align::Center);
+                            
+                            let name_label = Label::new(Some(&name));
+                            name_label.set_xalign(0.0);
+                            name_label.set_markup(&format!("<b>{}</b>", escape_markup(&name)));
+                            
+                            let character_label = Label::new(Some(&character));
+                            character_label.set_xalign(0.0);
+                            character_label.set_markup(&format!("<i>as {}</i>", escape_markup(&character)));
+                            
+                            info_box.append(&name_label);
+                            if !character.is_empty() {
+                                info_box.append(&character_label);
+                            }
+
+                            member_box.append(&info_box);
+                            cast_box_clone.append(&member_box);
+                            cast_box_clone.append(&Separator::new(Orientation::Horizontal));
+                            
+                            count += 1;
                         }
-                    } else {
-                        // Placeholder
-                        let placeholder = Label::new(Some("👤"));
-                        placeholder.set_markup("<span size='xx-large'>👤</span>");
-                        photo_box.append(&placeholder);
                     }
-
-                    member_box.append(&photo_box);
-
-                    // Actor info
-                    let info_box = Box::new(Orientation::Vertical, 4);
-                    info_box.set_valign(Align::Center);
-                    
-                    let name_label = Label::new(Some(&cast_member.name));
-                    name_label.set_xalign(0.0);
-                    name_label.set_markup(&format!("<b>{}</b>", escape_markup(&cast_member.name)));
-                    
-                    let character_label = Label::new(Some(&cast_member.character));
-                    character_label.set_xalign(0.0);
-                    character_label.set_markup(&format!("<i>as {}</i>", escape_markup(&cast_member.character)));
-                    
-                    info_box.append(&name_label);
-                    if !cast_member.character.is_empty() {
-                        info_box.append(&character_label);
-                    }
-
-                    member_box.append(&info_box);
-                    cast_box.append(&member_box);
-                    cast_box.append(&Separator::new(Orientation::Horizontal));
-                }
-
-                scroll.set_child(Some(&cast_box));
-                cast_dialog.set_child(Some(&scroll));
-                cast_dialog.present();
+                });
             }
         }
     });
