@@ -390,6 +390,10 @@ impl MovieDatabase {
 
 fn create_movie_row(movie: &Movie) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
+    
+    // Store the movie ID in the row's name property for later retrieval
+    row.set_widget_name(&movie.id.to_string());
+    
     let hbox = Box::new(Orientation::Horizontal, 12);
     hbox.set_margin_start(12);
     hbox.set_margin_end(12);
@@ -904,53 +908,57 @@ fn build_ui(app: &Application) {
     
     list_box.connect_row_selected(move |_, row| {
         if let Some(row) = row {
-            let index = row.index() as usize;
-            let movies = db_clone.borrow().list_all();
-            if let Some(movie) = movies.get(index) {
-                *selected_movie_id_clone.borrow_mut() = movie.id;
+            // Get the movie ID from the row's widget name
+            let movie_id_str = row.widget_name();
+            if let Ok(movie_id) = movie_id_str.as_str().parse::<u32>() {
+                *selected_movie_id_clone.borrow_mut() = movie_id;
                 
-                // Update poster
-                if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-                    if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
-                        poster_display_clone.set_pixbuf(Some(&pixbuf));
+                // Get the actual movie from the database by ID
+                let db = db_clone.borrow();
+                if let Some(movie) = db.movies.get(&movie_id) {
+                    // Update poster
+                    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+                        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
+                            poster_display_clone.set_pixbuf(Some(&pixbuf));
+                        }
+                    } else {
+                        poster_display_clone.set_pixbuf(None);
                     }
-                } else {
-                    poster_display_clone.set_pixbuf(None);
+                    
+                    // Escape all text that goes into markup
+                    let escaped_title = escape_markup(&movie.title);
+                    let escaped_director = escape_markup(&movie.director);
+                    let escaped_genre = escape_markup(&movie.genre.join(", "));
+                    let escaped_description = escape_markup(&movie.description);
+                    let escaped_file = escape_markup(&movie.file_path);
+                    
+                    // Format cast members with better visual presentation
+                    let cast_display = if !movie.cast.is_empty() {
+                        let cast_list: Vec<String> = movie.cast.iter()
+                            .map(|name| escape_markup(name))
+                            .collect();
+                        cast_list.join("\n    • ")
+                    } else {
+                        String::from("Unknown")
+                    };
+                    
+                    let details = format!(
+                        "<b>{}</b> ({})\n\n\
+                        <b>Director:</b> {}\n\
+                        <b>Genre:</b> {}\n\
+                        <b>Rating:</b> ⭐ {:.1}/10\n\
+                        <b>Runtime:</b> {} minutes\n\n\
+                        <b>Starring:</b>\n    • {}\n\n\
+                        <b>Description:</b>\n{}\n\n\
+                        <b>File:</b> {}\n\
+                        <b>TMDB ID:</b> {}",
+                        escaped_title, movie.year, escaped_director,
+                        escaped_genre, movie.rating, movie.runtime,
+                        cast_display, escaped_description, escaped_file,
+                        movie.tmdb_id
+                    );
+                    details_label_clone.set_markup(&details);
                 }
-                
-                // Escape all text that goes into markup
-                let escaped_title = escape_markup(&movie.title);
-                let escaped_director = escape_markup(&movie.director);
-                let escaped_genre = escape_markup(&movie.genre.join(", "));
-                let escaped_description = escape_markup(&movie.description);
-                let escaped_file = escape_markup(&movie.file_path);
-                
-                // Format cast members with better visual presentation
-                let cast_display = if !movie.cast.is_empty() {
-                    let cast_list: Vec<String> = movie.cast.iter()
-                        .map(|name| escape_markup(name))
-                        .collect();
-                    cast_list.join("\n    • ")
-                } else {
-                    String::from("Unknown")
-                };
-                
-                let details = format!(
-                    "<b>{}</b> ({})\n\n\
-                    <b>Director:</b> {}\n\
-                    <b>Genre:</b> {}\n\
-                    <b>Rating:</b> ⭐ {:.1}/10\n\
-                    <b>Runtime:</b> {} minutes\n\n\
-                    <b>Starring:</b>\n    • {}\n\n\
-                    <b>Description:</b>\n{}\n\n\
-                    <b>File:</b> {}\n\
-                    <b>TMDB ID:</b> {}",
-                    escaped_title, movie.year, escaped_director,
-                    escaped_genre, movie.rating, movie.runtime,
-                    cast_display, escaped_description, escaped_file,
-                    movie.tmdb_id
-                );
-                details_label_clone.set_markup(&details);
             }
         }
     });
