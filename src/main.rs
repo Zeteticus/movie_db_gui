@@ -85,6 +85,15 @@ fn load_config() -> Option<Config> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct CastMember {
+    name: String,
+    #[serde(default)]
+    profile_path: String,  // TMDB profile photo URL
+    #[serde(default)]
+    character: String,     // Character name
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Movie {
     id: u32,
     title: String,
@@ -94,7 +103,10 @@ struct Movie {
     rating: f32,
     runtime: u16,
     description: String,
-    cast: Vec<String>,
+    #[serde(default)]
+    cast: Vec<String>,  // Keep for backwards compatibility
+    #[serde(default)]
+    cast_details: Vec<CastMember>,  // New detailed cast info
     file_path: String,
     poster_url: String,
     tmdb_id: u32,
@@ -146,6 +158,10 @@ struct TMDBCredits {
 #[derive(Debug, Deserialize)]
 struct TMDBCast {
     name: String,
+    #[serde(default)]
+    character: String,
+    #[serde(default)]
+    profile_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +258,18 @@ async fn fetch_movie_metadata_async(
         .map(|c| c.name.clone())
         .collect();
     
+    let cast_details: Vec<CastMember> = details.credits.cast
+        .iter()
+        .take(5)
+        .map(|c| CastMember {
+            name: c.name.clone(),
+            character: c.character.clone(),
+            profile_path: c.profile_path.as_ref()
+                .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                .unwrap_or_default(),
+        })
+        .collect();
+    
     let genres: Vec<String> = details.genres
         .iter()
         .map(|g| g.name.clone())
@@ -267,6 +295,7 @@ async fn fetch_movie_metadata_async(
         runtime: details.runtime.unwrap_or(0),
         description: details.overview,
         cast,
+        cast_details,
         file_path,
         poster_url,
         tmdb_id: movie_id,
@@ -641,8 +670,10 @@ fn build_ui(app: &Application) {
 
     let action_box = Box::new(Orientation::Horizontal, 8);
     let play_button = Button::with_label("▶️ Play in VLC");
+    let show_cast_button = Button::with_label("⭐ Show Cast");
     let delete_button = Button::with_label("🗑️ Delete");
     action_box.append(&play_button);
+    action_box.append(&show_cast_button);
     action_box.append(&delete_button);
     details_box.append(&action_box);
 
@@ -747,6 +778,7 @@ fn build_ui(app: &Application) {
                                                     runtime: 0,
                                                     description: String::from("Metadata not found"),
                                                     cast: vec![],
+                                                    cast_details: vec![],
                                                     file_path,
                                                     poster_url: String::new(),
                                                     tmdb_id: 0,
@@ -890,23 +922,32 @@ fn build_ui(app: &Application) {
                 let escaped_title = escape_markup(&movie.title);
                 let escaped_director = escape_markup(&movie.director);
                 let escaped_genre = escape_markup(&movie.genre.join(", "));
-                let escaped_cast = escape_markup(&movie.cast.join(", "));
                 let escaped_description = escape_markup(&movie.description);
                 let escaped_file = escape_markup(&movie.file_path);
+                
+                // Format cast members with better visual presentation
+                let cast_display = if !movie.cast.is_empty() {
+                    let cast_list: Vec<String> = movie.cast.iter()
+                        .map(|name| escape_markup(name))
+                        .collect();
+                    cast_list.join("\n    • ")
+                } else {
+                    String::from("Unknown")
+                };
                 
                 let details = format!(
                     "<b>{}</b> ({})\n\n\
                     <b>Director:</b> {}\n\
                     <b>Genre:</b> {}\n\
                     <b>Rating:</b> ⭐ {:.1}/10\n\
-                    <b>Runtime:</b> {} minutes\n\
-                    <b>Cast:</b> {}\n\n\
+                    <b>Runtime:</b> {} minutes\n\n\
+                    <b>Starring:</b>\n    • {}\n\n\
                     <b>Description:</b>\n{}\n\n\
                     <b>File:</b> {}\n\
                     <b>TMDB ID:</b> {}",
                     escaped_title, movie.year, escaped_director,
                     escaped_genre, movie.rating, movie.runtime,
-                    escaped_cast, escaped_description, escaped_file,
+                    cast_display, escaped_description, escaped_file,
                     movie.tmdb_id
                 );
                 details_label_clone.set_markup(&details);
@@ -993,6 +1034,104 @@ fn build_ui(app: &Application) {
         }
     });
 
+    // Show Cast button - display cast photos
+    let db_clone = db.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    let window_clone = window.clone();
+    show_cast_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id > 0 {
+            let db = db_clone.borrow();
+            if let Some(movie) = db.movies.get(&movie_id) {
+                if movie.cast_details.is_empty() {
+                    let dialog = gtk::AlertDialog::builder()
+                        .message("No Cast Information")
+                        .detail("Cast information is not available for this movie.")
+                        .buttons(vec!["OK"])
+                        .build();
+                    dialog.show(Some(&window_clone));
+                    return;
+                }
+
+                // Create cast dialog
+                let cast_dialog = Window::builder()
+                    .title(&format!("Cast of {}", movie.title))
+                    .modal(true)
+                    .transient_for(&window_clone)
+                    .default_width(600)
+                    .default_height(500)
+                    .build();
+
+                let scroll = ScrolledWindow::new();
+                scroll.set_vexpand(true);
+                
+                let cast_box = Box::new(Orientation::Vertical, 12);
+                cast_box.set_margin_start(20);
+                cast_box.set_margin_end(20);
+                cast_box.set_margin_top(20);
+                cast_box.set_margin_bottom(20);
+
+                for cast_member in &movie.cast_details {
+                    let member_box = Box::new(Orientation::Horizontal, 12);
+                    member_box.set_margin_bottom(12);
+
+                    // Actor photo
+                    let photo_box = Box::new(Orientation::Vertical, 0);
+                    photo_box.set_size_request(120, 180);
+                    
+                    if !cast_member.profile_path.is_empty() {
+                        // Try to load photo from URL
+                        if let Ok(response) = reqwest::blocking::get(&cast_member.profile_path) {
+                            if let Ok(bytes) = response.bytes() {
+                                let loader = gtk::gdk_pixbuf::PixbufLoader::new();
+                                let _ = loader.write(&bytes);
+                                let _ = loader.close();
+                                if let Some(pixbuf) = loader.pixbuf() {
+                                    if let Some(scaled_pixbuf) = pixbuf.scale_simple(120, 180, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                                        let picture = Picture::for_pixbuf(&scaled_pixbuf);
+                                        photo_box.append(&picture);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Placeholder
+                        let placeholder = Label::new(Some("👤"));
+                        placeholder.set_markup("<span size='xx-large'>👤</span>");
+                        photo_box.append(&placeholder);
+                    }
+
+                    member_box.append(&photo_box);
+
+                    // Actor info
+                    let info_box = Box::new(Orientation::Vertical, 4);
+                    info_box.set_valign(Align::Center);
+                    
+                    let name_label = Label::new(Some(&cast_member.name));
+                    name_label.set_xalign(0.0);
+                    name_label.set_markup(&format!("<b>{}</b>", escape_markup(&cast_member.name)));
+                    
+                    let character_label = Label::new(Some(&cast_member.character));
+                    character_label.set_xalign(0.0);
+                    character_label.set_markup(&format!("<i>as {}</i>", escape_markup(&cast_member.character)));
+                    
+                    info_box.append(&name_label);
+                    if !cast_member.character.is_empty() {
+                        info_box.append(&character_label);
+                    }
+
+                    member_box.append(&info_box);
+                    cast_box.append(&member_box);
+                    cast_box.append(&Separator::new(Orientation::Horizontal));
+                }
+
+                scroll.set_child(Some(&cast_box));
+                cast_dialog.set_child(Some(&scroll));
+                cast_dialog.present();
+            }
+        }
+    });
+
     // Scan directory
     let window_clone = window.clone();
     let db_clone = db.clone();
@@ -1071,6 +1210,7 @@ fn build_ui(app: &Application) {
                                                         runtime: 0,
                                                         description: String::from("Metadata not found"),
                                                         cast: vec![],
+                                                        cast_details: vec![],
                                                         file_path,
                                                         poster_url: String::new(),
                                                         tmdb_id: 0,
@@ -1194,6 +1334,18 @@ fn build_ui(app: &Application) {
                                         .map(|c| c.name.clone())
                                         .collect();
                                     
+                                    let cast_details: Vec<CastMember> = details.credits.cast
+                                        .iter()
+                                        .take(5)
+                                        .map(|c| CastMember {
+                                            name: c.name.clone(),
+                                            character: c.character.clone(),
+                                            profile_path: c.profile_path.as_ref()
+                                                .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                                                .unwrap_or_default(),
+                                        })
+                                        .collect();
+                                    
                                     let genres: Vec<String> = details.genres
                                         .iter()
                                         .map(|g| g.name.clone())
@@ -1219,6 +1371,7 @@ fn build_ui(app: &Application) {
                                         runtime: details.runtime.unwrap_or(0),
                                         description: details.overview,
                                         cast,
+                                        cast_details,
                                         file_path: file_path.clone(),
                                         poster_url,
                                         tmdb_id: tmdb_movie_id,
@@ -1366,6 +1519,18 @@ fn build_ui(app: &Application) {
                                             .map(|c| c.name.clone())
                                             .collect();
                                         
+                                        let cast_details: Vec<CastMember> = details.credits.cast
+                                            .iter()
+                                            .take(5)
+                                            .map(|c| CastMember {
+                                                name: c.name.clone(),
+                                                character: c.character.clone(),
+                                                profile_path: c.profile_path.as_ref()
+                                                    .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                                                    .unwrap_or_default(),
+                                            })
+                                            .collect();
+                                        
                                         let genres: Vec<String> = details.genres
                                             .iter()
                                             .map(|g| g.name.clone())
@@ -1391,6 +1556,7 @@ fn build_ui(app: &Application) {
                                             runtime: details.runtime.unwrap_or(0),
                                             description: details.overview,
                                             cast,
+                                            cast_details,
                                             file_path: String::new(),
                                             poster_url,
                                             tmdb_id: movie_id,

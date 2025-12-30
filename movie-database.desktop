@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Movie Database
+Comment=Manage your movie collection with TMDB metadata
+Icon=movie-database
+Exec=/home/ascensus/movie_db_gui/target/release/movie-database
+Terminal=false
+Categories=AudioVideo;Video;Database;
+Keywords=movie;film;video;database;tmdb;media;collection;
+StartupNotify=true
+StartupWMClass=movie-database
