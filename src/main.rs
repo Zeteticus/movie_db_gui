@@ -9,13 +9,13 @@
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box, Button, Entry, Label, ListBox, ScrolledWindow, 
           Orientation, SearchEntry, DropDown, Grid, Frame, Separator, StringList, Window, Picture, 
-          Align};
+          Align, CheckButton};
 use gtk::gdk_pixbuf::Pixbuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, read_dir, create_dir_all};
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write, Read};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,60 @@ fn escape_markup(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+// Get config directory path
+fn get_config_dir() -> PathBuf {
+    let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("movie-database");
+    path
+}
+
+// Get config file path
+fn get_config_file() -> PathBuf {
+    let mut path = get_config_dir();
+    path.push("config.json");
+    path
+}
+
+// Configuration structure
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Config {
+    tmdb_api_key: String,
+    #[serde(default)]
+    scan_directories: Vec<String>,
+    #[serde(default = "default_auto_scan")]
+    auto_scan_on_startup: bool,
+}
+
+fn default_auto_scan() -> bool {
+    true  // Enable by default
+}
+
+// Save config to file
+fn save_config(config: &Config) -> std::io::Result<()> {
+    let config_dir = get_config_dir();
+    create_dir_all(&config_dir)?;
+    
+    let config_file = get_config_file();
+    let json = serde_json::to_string_pretty(config)?;
+    std::fs::write(config_file, json)?;
+    
+    Ok(())
+}
+
+// Load config from file
+fn load_config() -> Option<Config> {
+    let config_file = get_config_file();
+    if !config_file.exists() {
+        return None;
+    }
+    
+    let mut file = File::open(config_file).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    
+    serde_json::from_str(&contents).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,12 +322,20 @@ fn create_movie_row(movie: &Movie) -> gtk::ListBoxRow {
 }
 
 fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
+    // Try to load existing config first
+    if let Some(config) = load_config() {
+        if !config.tmdb_api_key.is_empty() {
+            println!("Loaded API key from config");
+            return Some(config.tmdb_api_key);
+        }
+    }
+    
     let dialog = Window::builder()
         .title("TMDB API Key Required")
         .modal(true)
         .transient_for(window)
         .default_width(500)
-        .default_height(200)
+        .default_height(220)
         .build();
 
     let content = Box::new(Orientation::Vertical, 12);
@@ -285,12 +347,13 @@ fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
     let info_label = Label::new(Some(
         "To fetch movie metadata, you need a TMDB API key.\n\
         Get one free at: https://www.themoviedb.org/settings/api\n\n\
-        Enter your API key below:"
+        Enter your API key below (it will be saved for future use):"
     ));
     info_label.set_wrap(true);
 
     let api_entry = Entry::new();
     api_entry.set_placeholder_text(Some("Enter TMDB API key"));
+    api_entry.set_visibility(false);  // Hide the key like a password
 
     let button_box = Box::new(Orientation::Horizontal, 8);
     button_box.set_halign(gtk::Align::End);
@@ -308,7 +371,19 @@ fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
     let dialog_clone = dialog.clone();
     
     ok_btn.connect_clicked(move |_| {
-        *api_key_clone.borrow_mut() = api_entry.text().to_string();
+        let key = api_entry.text().to_string();
+        if !key.is_empty() {
+            // Save the API key to config
+            let config = Config {
+                tmdb_api_key: key.clone(),
+            };
+            if let Err(e) = save_config(&config) {
+                eprintln!("Warning: Could not save config: {}", e);
+            } else {
+                println!("API key saved to config");
+            }
+            *api_key_clone.borrow_mut() = key;
+        }
         dialog_clone.close();
     });
 
@@ -358,11 +433,13 @@ fn build_ui(app: &Application) {
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
+    let settings_button = Button::with_label("⚙️ Settings");
     
     header.append(&title_label);
     header.append(&Box::new(Orientation::Horizontal, 0));
     header.set_hexpand(true);
     title_label.set_hexpand(true);
+    header.append(&settings_button);
     header.append(&refresh_button);
     header.append(&scan_button);
     header.append(&add_button);
@@ -453,6 +530,170 @@ fn build_ui(app: &Application) {
     for movie in &movies {
         let row = create_movie_row(movie);
         list_box.append(&row);
+    }
+
+    // Auto-scan on startup if enabled
+    let config = load_config().unwrap_or_default();
+    if config.auto_scan_on_startup && !config.scan_directories.is_empty() {
+        let db_clone = db.clone();
+        let list_box_clone = list_box.clone();
+        let status_bar_clone = status_bar.clone();
+        let api_key = db_clone.borrow().tmdb_api_key.clone();
+        let scan_dirs = config.scan_directories.clone();
+        
+        status_bar_clone.set_text("Auto-scanning configured directories...");
+        
+        // Spawn auto-scan in background
+        let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
+        
+        std::thread::spawn(move || {
+            for scan_dir in &scan_dirs {
+                let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {}", scan_dir), None));
+                
+                let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                
+                if let Ok(entries) = read_dir(scan_dir) {
+                    for entry in entries.flatten() {
+                        let entry_path = entry.path();
+                        if entry_path.is_file() {
+                            if let Some(ext) = entry_path.extension() {
+                                let ext_str = ext.to_string_lossy().to_lowercase();
+                                if video_extensions.contains(&ext_str.as_str()) {
+                                    if let Some(file_name) = entry_path.file_stem() {
+                                        let title = file_name.to_string_lossy().to_string();
+                                        let file_path_str = entry_path.to_string_lossy().to_string();
+                                        
+                                        let clean_title = title
+                                            .replace('.', " ")
+                                            .replace('_', " ")
+                                            .trim()
+                                            .to_string();
+                                        
+                                        let _ = sender.send_blocking(("status".to_string(), format!("Checking: {}", clean_title), None));
+                                        
+                                        // Fetch metadata
+                                        let client = reqwest::blocking::Client::new();
+                                        let search_url = format!(
+                                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                                            api_key,
+                                            urlencoding::encode(&clean_title)
+                                        );
+                                        
+                                        if let Ok(response) = client.get(&search_url).send() {
+                                            if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
+                                                if !search_response.results.is_empty() {
+                                                    let movie_id = search_response.results[0].id;
+                                                    let details_url = format!(
+                                                        "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
+                                                        movie_id, api_key
+                                                    );
+                                                    
+                                                    if let Ok(details_response) = client.get(&details_url).send() {
+                                                        if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
+                                                            let year: u16 = details.release_date
+                                                                .split('-')
+                                                                .next()
+                                                                .and_then(|y| y.parse().ok())
+                                                                .unwrap_or(0);
+                                                            
+                                                            let director = details.credits.crew
+                                                                .iter()
+                                                                .find(|c| c.job == "Director")
+                                                                .map(|c| c.name.clone())
+                                                                .unwrap_or_else(|| "Unknown".to_string());
+                                                            
+                                                            let cast: Vec<String> = details.credits.cast
+                                                                .iter()
+                                                                .take(5)
+                                                                .map(|c| c.name.clone())
+                                                                .collect();
+                                                            
+                                                            let genres: Vec<String> = details.genres
+                                                                .iter()
+                                                                .map(|g| g.name.clone())
+                                                                .collect();
+                                                            
+                                                            let poster_url = details.poster_path
+                                                                .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                                                .unwrap_or_default();
+                                                            
+                                                            let poster_path = if !poster_url.is_empty() {
+                                                                download_poster(&poster_url, movie_id).unwrap_or_default()
+                                                            } else {
+                                                                String::new()
+                                                            };
+                                                            
+                                                            let movie = Movie {
+                                                                id: 0,
+                                                                title: details.title,
+                                                                year,
+                                                                director,
+                                                                genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
+                                                                rating: details.vote_average,
+                                                                runtime: details.runtime.unwrap_or(0),
+                                                                description: details.overview,
+                                                                cast,
+                                                                file_path: file_path_str,
+                                                                poster_url,
+                                                                tmdb_id: movie_id,
+                                                                poster_path,
+                                                            };
+                                                            
+                                                            let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", clean_title), Some(movie)));
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+        });
+        
+        // Handle messages on main thread
+        glib::spawn_future_local(async move {
+            let mut new_movies_count = 0;
+            while let Ok((msg_type, status, movie_opt)) = receiver.recv().await {
+                match msg_type.as_str() {
+                    "status" => {
+                        status_bar_clone.set_text(&status);
+                    }
+                    "add" => {
+                        if let Some(movie) = movie_opt {
+                            // Check if movie already exists
+                            let exists = db_clone.borrow().movies.values()
+                                .any(|m| m.file_path == movie.file_path);
+                            
+                            if !exists {
+                                db_clone.borrow_mut().add_movie(movie.clone());
+                                new_movies_count += 1;
+                                
+                                // Add to UI
+                                let row = create_movie_row(&movie);
+                                list_box_clone.append(&row);
+                            }
+                        }
+                        status_bar_clone.set_text(&status);
+                    }
+                    "complete" => {
+                        if new_movies_count > 0 {
+                            status_bar_clone.set_text(&format!("Auto-scan complete! Added {} new movies", new_movies_count));
+                        } else {
+                            status_bar_clone.set_text("Auto-scan complete - no new movies found");
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     // Search functionality
@@ -1130,6 +1371,202 @@ fn build_ui(app: &Application) {
                     }
                 });
             }
+        });
+
+        dialog.present();
+    });
+
+    // Settings button - change API key and manage scan directories
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    let status_bar_clone = status_bar.clone();
+    settings_button.connect_clicked(move |_| {
+        let dialog = Window::builder()
+            .title("Settings")
+            .modal(true)
+            .transient_for(&window_clone)
+            .default_width(600)
+            .default_height(400)
+            .build();
+
+        let content = Box::new(Orientation::Vertical, 12);
+        content.set_margin_start(12);
+        content.set_margin_end(12);
+        content.set_margin_top(12);
+        content.set_margin_bottom(12);
+
+        // API Key section
+        let api_label = Label::new(Some("TMDB API Key:"));
+        api_label.set_xalign(0.0);
+        api_label.set_markup("<b>TMDB API Key:</b>");
+
+        let api_entry = Entry::new();
+        api_entry.set_text(&db_clone.borrow().tmdb_api_key);
+        api_entry.set_visibility(false);
+
+        content.append(&api_label);
+        content.append(&api_entry);
+        content.append(&Separator::new(Orientation::Horizontal));
+
+        // Scan directories section
+        let scan_label = Label::new(Some("Scan Directories:"));
+        scan_label.set_xalign(0.0);
+        scan_label.set_markup("<b>Scan Directories:</b>");
+        content.append(&scan_label);
+
+        // Load current config
+        let current_config = load_config().unwrap_or_default();
+        
+        // List of scan directories
+        let dirs_box = Box::new(Orientation::Vertical, 4);
+        let dirs_list = Rc::new(RefCell::new(current_config.scan_directories.clone()));
+        
+        let scrolled = ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_min_content_height(150);
+        
+        let list_box = ListBox::new();
+        
+        // Populate existing directories
+        for dir in &current_config.scan_directories {
+            let row = gtk::ListBoxRow::new();
+            let hbox = Box::new(Orientation::Horizontal, 8);
+            hbox.set_margin_start(8);
+            hbox.set_margin_end(8);
+            hbox.set_margin_top(4);
+            hbox.set_margin_bottom(4);
+            
+            let dir_label = Label::new(Some(dir));
+            dir_label.set_xalign(0.0);
+            dir_label.set_hexpand(true);
+            
+            let remove_btn = Button::with_label("Remove");
+            
+            hbox.append(&dir_label);
+            hbox.append(&remove_btn);
+            row.set_child(Some(&hbox));
+            list_box.append(&row);
+            
+            // Remove button handler
+            let dirs_list_clone = dirs_list.clone();
+            let dir_to_remove = dir.clone();
+            let list_box_clone = list_box.clone();
+            remove_btn.connect_clicked(move |btn| {
+                dirs_list_clone.borrow_mut().retain(|d| d != &dir_to_remove);
+                // Remove the row from UI
+                if let Some(row) = btn.parent().and_then(|p| p.parent()) {
+                    list_box_clone.remove(&row);
+                }
+            });
+        }
+        
+        scrolled.set_child(Some(&list_box));
+        dirs_box.append(&scrolled);
+        
+        let add_dir_box = Box::new(Orientation::Horizontal, 8);
+        let add_dir_btn = Button::with_label("➕ Add Directory");
+        add_dir_box.append(&add_dir_btn);
+        dirs_box.append(&add_dir_box);
+        
+        content.append(&dirs_box);
+        
+        // Add directory handler
+        let window_clone2 = window_clone.clone();
+        let dirs_list_clone = dirs_list.clone();
+        let list_box_clone = list_box.clone();
+        add_dir_btn.connect_clicked(move |_| {
+            let file_dialog = gtk::FileDialog::new();
+            file_dialog.set_title("Select Directory to Scan");
+            
+            let dirs_list_clone2 = dirs_list_clone.clone();
+            let list_box_clone2 = list_box_clone.clone();
+            file_dialog.select_folder(Some(&window_clone2), None::<&gtk::gio::Cancellable>, move |result| {
+                if let Ok(folder) = result {
+                    if let Some(path) = folder.path() {
+                        let path_str = path.to_string_lossy().to_string();
+                        
+                        // Add to list
+                        dirs_list_clone2.borrow_mut().push(path_str.clone());
+                        
+                        // Add to UI
+                        let row = gtk::ListBoxRow::new();
+                        let hbox = Box::new(Orientation::Horizontal, 8);
+                        hbox.set_margin_start(8);
+                        hbox.set_margin_end(8);
+                        hbox.set_margin_top(4);
+                        hbox.set_margin_bottom(4);
+                        
+                        let dir_label = Label::new(Some(&path_str));
+                        dir_label.set_xalign(0.0);
+                        dir_label.set_hexpand(true);
+                        
+                        let remove_btn = Button::with_label("Remove");
+                        
+                        hbox.append(&dir_label);
+                        hbox.append(&remove_btn);
+                        row.set_child(Some(&hbox));
+                        list_box_clone2.append(&row);
+                        
+                        // Remove button handler
+                        let dirs_list_clone3 = dirs_list_clone2.clone();
+                        let path_str_clone = path_str.clone();
+                        let list_box_clone3 = list_box_clone2.clone();
+                        remove_btn.connect_clicked(move |btn| {
+                            dirs_list_clone3.borrow_mut().retain(|d| d != &path_str_clone);
+                            if let Some(row) = btn.parent().and_then(|p| p.parent()) {
+                                list_box_clone3.remove(&row);
+                            }
+                        });
+                    }
+                }
+            });
+        });
+        
+        content.append(&Separator::new(Orientation::Horizontal));
+        
+        // Auto-scan checkbox
+        let auto_scan_check = gtk::CheckButton::with_label("Automatically scan directories on startup");
+        auto_scan_check.set_active(current_config.auto_scan_on_startup);
+        content.append(&auto_scan_check);
+
+        // Buttons
+        let button_box = Box::new(Orientation::Horizontal, 8);
+        button_box.set_halign(gtk::Align::End);
+        let cancel_btn = Button::with_label("Cancel");
+        let save_btn = Button::with_label("Save");
+        button_box.append(&cancel_btn);
+        button_box.append(&save_btn);
+        content.append(&button_box);
+
+        dialog.set_child(Some(&content));
+
+        let dialog_clone = dialog.clone();
+        cancel_btn.connect_clicked(move |_| {
+            dialog_clone.close();
+        });
+
+        let dialog_clone = dialog.clone();
+        let db_clone2 = db_clone.clone();
+        let status_bar_clone2 = status_bar_clone.clone();
+        save_btn.connect_clicked(move |_| {
+            let new_key = api_entry.text().to_string();
+            if !new_key.is_empty() {
+                // Update database API key
+                db_clone2.borrow_mut().tmdb_api_key = new_key.clone();
+                
+                // Save to config
+                let config = Config {
+                    tmdb_api_key: new_key,
+                    scan_directories: dirs_list.borrow().clone(),
+                    auto_scan_on_startup: auto_scan_check.is_active(),
+                };
+                if let Err(e) = save_config(&config) {
+                    status_bar_clone2.set_text(&format!("Error saving config: {}", e));
+                } else {
+                    status_bar_clone2.set_text("Settings saved successfully");
+                }
+            }
+            dialog_clone.close();
         });
 
         dialog.present();
