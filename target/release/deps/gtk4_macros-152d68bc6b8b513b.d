@@ -1,0 +1,9 @@
+/home/ascensus/movie_db_gui/target/release/deps/gtk4_macros-152d68bc6b8b513b.d: /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/lib.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/attribute_parser.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/composite_template_derive.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/template_callbacks_attribute.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/util.rs
+
+/home/ascensus/movie_db_gui/target/release/deps/libgtk4_macros-152d68bc6b8b513b.so: /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/lib.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/attribute_parser.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/composite_template_derive.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/template_callbacks_attribute.rs /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/util.rs
+
+/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/lib.rs:
+/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/attribute_parser.rs:
+/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/composite_template_derive.rs:
+/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/template_callbacks_attribute.rs:
+/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gtk4-macros-0.7.2/src/util.rs:
