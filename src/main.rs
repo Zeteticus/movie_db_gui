@@ -8,15 +8,27 @@
 
 use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box, Button, Entry, Label, ListBox, ScrolledWindow, 
-          Orientation, SearchEntry, DropDown, Grid, Frame, Separator, StringList, Window};
+          Orientation, SearchEntry, DropDown, Grid, Frame, Separator, StringList, Window, Picture, 
+          Align};
+use gtk::gdk_pixbuf::Pixbuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::{File, read_dir};
+use std::fs::{File, read_dir, create_dir_all};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::rc::Rc;
+use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use gtk::glib;
+
+// Helper function to escape HTML entities in strings for Pango markup
+fn escape_markup(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Movie {
@@ -32,6 +44,8 @@ struct Movie {
     file_path: String,
     poster_url: String,
     tmdb_id: u32,
+    #[serde(default)]
+    poster_path: String,  // Local cached poster path
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +105,27 @@ struct MovieDatabase {
     next_id: u32,
     data_file: String,
     tmdb_api_key: String,
+}
+
+fn download_poster(poster_url: &str, movie_id: u32) -> Option<String> {
+    if poster_url.is_empty() {
+        return None;
+    }
+    
+    // Create posters directory if it doesn't exist
+    let posters_dir = "posters";
+    create_dir_all(posters_dir).ok()?;
+    
+    // Download the poster
+    let response = reqwest::blocking::get(poster_url).ok()?;
+    let bytes = response.bytes().ok()?;
+    
+    // Save to local file
+    let poster_path = format!("{}/poster_{}.jpg", posters_dir, movie_id);
+    let mut file = File::create(&poster_path).ok()?;
+    std::io::copy(&mut bytes.as_ref(), &mut file).ok()?;
+    
+    Some(poster_path)
 }
 
 impl MovieDatabase {
@@ -186,11 +221,32 @@ fn create_movie_row(movie: &Movie) -> gtk::ListBoxRow {
     hbox.set_margin_top(8);
     hbox.set_margin_bottom(8);
 
+    // Add poster thumbnail
+    let poster_box = Box::new(Orientation::Vertical, 0);
+    poster_box.set_size_request(60, 90);
+    
+    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 60, 90, true) {
+            let picture = Picture::for_pixbuf(&pixbuf);
+            picture.set_can_shrink(true);
+            poster_box.append(&picture);
+        }
+    } else {
+        // Placeholder for missing poster
+        let placeholder = Label::new(Some("🎬"));
+        placeholder.set_markup("<span size='xx-large'>🎬</span>");
+        poster_box.append(&placeholder);
+    }
+    
+    hbox.append(&poster_box);
+
     let vbox = Box::new(Orientation::Vertical, 4);
     
     let title_label = Label::new(Some(&format!("{} ({})", movie.title, movie.year)));
     title_label.set_xalign(0.0);
-    title_label.set_markup(&format!("<b>{}</b> ({})", movie.title, movie.year));
+    // Escape special characters for Pango markup
+    let escaped_title = escape_markup(&movie.title);
+    title_label.set_markup(&format!("<b>{}</b> ({})", escaped_title, movie.year));
     
     let info_label = Label::new(Some(&format!("⭐ {:.1}/10 | {} | {} min", 
         movie.rating, movie.genre.join(", "), movie.runtime)));
@@ -356,11 +412,22 @@ fn build_ui(app: &Application) {
     details_frame.set_margin_top(12);
     details_frame.set_margin_bottom(12);
 
+    let details_main_box = Box::new(Orientation::Horizontal, 12);
+    details_main_box.set_margin_start(12);
+    details_main_box.set_margin_end(12);
+    details_main_box.set_margin_top(12);
+    details_main_box.set_margin_bottom(12);
+
+    // Poster display area
+    let poster_display = Picture::new();
+    poster_display.set_size_request(200, 300);
+    poster_display.set_can_shrink(true);
+    poster_display.set_halign(Align::Start);
+    poster_display.set_valign(Align::Start);
+    details_main_box.append(&poster_display);
+
     let details_box = Box::new(Orientation::Vertical, 8);
-    details_box.set_margin_start(12);
-    details_box.set_margin_end(12);
-    details_box.set_margin_top(12);
-    details_box.set_margin_bottom(12);
+    details_box.set_hexpand(true);
 
     let details_label = Label::new(Some("Select a movie to view details"));
     details_label.set_xalign(0.0);
@@ -368,11 +435,14 @@ fn build_ui(app: &Application) {
     details_box.append(&details_label);
 
     let action_box = Box::new(Orientation::Horizontal, 8);
+    let play_button = Button::with_label("▶️ Play in VLC");
     let delete_button = Button::with_label("🗑️ Delete");
+    action_box.append(&play_button);
     action_box.append(&delete_button);
     details_box.append(&action_box);
 
-    details_frame.set_child(Some(&details_box));
+    details_main_box.append(&details_box);
+    details_frame.set_child(Some(&details_main_box));
     main_box.append(&details_frame);
 
     window.set_child(Some(&main_box));
@@ -439,6 +509,7 @@ fn build_ui(app: &Application) {
 
     // Movie selection
     let details_label_clone = details_label.clone();
+    let poster_display_clone = poster_display.clone();
     let db_clone = db.clone();
     let selected_movie_id = Rc::new(RefCell::new(0u32));
     let selected_movie_id_clone = selected_movie_id.clone();
@@ -449,6 +520,24 @@ fn build_ui(app: &Application) {
             let movies = db_clone.borrow().list_all();
             if let Some(movie) = movies.get(index) {
                 *selected_movie_id_clone.borrow_mut() = movie.id;
+                
+                // Update poster
+                if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+                    if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
+                        poster_display_clone.set_pixbuf(Some(&pixbuf));
+                    }
+                } else {
+                    poster_display_clone.set_pixbuf(None);
+                }
+                
+                // Escape all text that goes into markup
+                let escaped_title = escape_markup(&movie.title);
+                let escaped_director = escape_markup(&movie.director);
+                let escaped_genre = escape_markup(&movie.genre.join(", "));
+                let escaped_cast = escape_markup(&movie.cast.join(", "));
+                let escaped_description = escape_markup(&movie.description);
+                let escaped_file = escape_markup(&movie.file_path);
+                
                 let details = format!(
                     "<b>{}</b> ({})\n\n\
                     <b>Director:</b> {}\n\
@@ -459,12 +548,56 @@ fn build_ui(app: &Application) {
                     <b>Description:</b>\n{}\n\n\
                     <b>File:</b> {}\n\
                     <b>TMDB ID:</b> {}",
-                    movie.title, movie.year, movie.director,
-                    movie.genre.join(", "), movie.rating, movie.runtime,
-                    movie.cast.join(", "), movie.description, movie.file_path,
+                    escaped_title, movie.year, escaped_director,
+                    escaped_genre, movie.rating, movie.runtime,
+                    escaped_cast, escaped_description, escaped_file,
                     movie.tmdb_id
                 );
                 details_label_clone.set_markup(&details);
+            }
+        }
+    });
+
+    // Play button - launch VLC
+    let db_clone = db.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    let status_bar_clone = status_bar.clone();
+    play_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id > 0 {
+            let db = db_clone.borrow();
+            if let Some(movie) = db.movies.get(&movie_id) {
+                if !movie.file_path.is_empty() && Path::new(&movie.file_path).exists() {
+                    // Try to launch VLC with suppressed output
+                    match Command::new("vlc")
+                        .arg(&movie.file_path)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                    {
+                        Ok(_) => {
+                            status_bar_clone.set_text(&format!("Playing: {}", movie.title));
+                        }
+                        Err(_) => {
+                            // Try flatpak version
+                            match Command::new("flatpak")
+                                .args(["run", "org.videolan.VLC", &movie.file_path])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .spawn()
+                            {
+                                Ok(_) => {
+                                    status_bar_clone.set_text(&format!("Playing: {}", movie.title));
+                                }
+                                Err(_) => {
+                                    status_bar_clone.set_text("VLC not found. Please install VLC.");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    status_bar_clone.set_text("No video file associated with this movie");
+                }
             }
         }
     });
@@ -601,6 +734,13 @@ fn build_ui(app: &Application) {
                                                                         .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
                                                                         .unwrap_or_default();
                                                                     
+                                                                    // Download poster (we'll use a temporary ID 0 for now)
+                                                                    let poster_path = if !poster_url.is_empty() {
+                                                                        download_poster(&poster_url, movie_id).unwrap_or_default()
+                                                                    } else {
+                                                                        String::new()
+                                                                    };
+                                                                    
                                                                     let movie = Movie {
                                                                         id: 0,
                                                                         title: details.title,
@@ -614,6 +754,7 @@ fn build_ui(app: &Application) {
                                                                         file_path: file_path_str,
                                                                         poster_url,
                                                                         tmdb_id: movie_id,
+                                                                        poster_path,
                                                                     };
                                                                     
                                                                     let _ = sender.send_blocking(("add".to_string(), format!("✓ Added: {}", clean_title), Some(movie)));
@@ -638,6 +779,7 @@ fn build_ui(app: &Application) {
                                                     file_path: file_path_str,
                                                     poster_url: String::new(),
                                                     tmdb_id: 0,
+                                                    poster_path: String::new(),
                                                 };
                                                 let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", clean_title), Some(movie)));
                                             }
@@ -763,6 +905,12 @@ fn build_ui(app: &Application) {
                                         .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
                                         .unwrap_or_default();
                                     
+                                    let poster_path = if !poster_url.is_empty() {
+                                        download_poster(&poster_url, tmdb_movie_id).unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    };
+                                    
                                     let movie = Movie {
                                         id: 0,
                                         title: details.title,
@@ -776,6 +924,7 @@ fn build_ui(app: &Application) {
                                         file_path: file_path.clone(),
                                         poster_url,
                                         tmdb_id: tmdb_movie_id,
+                                        poster_path,
                                     };
                                     
                                     let _ = sender.send_blocking(Some((movie_id, movie)));
@@ -928,6 +1077,12 @@ fn build_ui(app: &Application) {
                                             .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
                                             .unwrap_or_default();
                                         
+                                        let poster_path = if !poster_url.is_empty() {
+                                            download_poster(&poster_url, movie_id).unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        };
+                                        
                                         let movie = Movie {
                                             id: 0,
                                             title: details.title.clone(),
@@ -941,6 +1096,7 @@ fn build_ui(app: &Application) {
                                             file_path: String::new(),
                                             poster_url,
                                             tmdb_id: movie_id,
+                                            poster_path,
                                         };
                                         
                                         let _ = sender.send_blocking(Some((details.title, movie)));
