@@ -593,6 +593,7 @@ fn build_ui(app: &Application) {
         .title("Mark's Movie Database (MMDB)")
         .default_width(1000)
         .default_height(700)
+        .maximized(true)
         .build();
 
     let api_key = match show_api_key_dialog(&window) {
@@ -1721,6 +1722,233 @@ fn build_ui(app: &Application) {
         }
     });
 
+    // Edit Metadata button
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    let details_label_clone = details_label.clone();
+    let list_box_clone = list_box.clone();
+    let status_bar_clone = status_bar.clone();
+    edit_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id == 0 {
+            status_bar_clone.set_text("Please select a movie first");
+            return;
+        }
+        
+        let movie = db_clone.borrow().movies.get(&movie_id).cloned();
+        if let Some(movie) = movie {
+            // Create edit dialog
+            let dialog = Window::builder()
+                .title(&format!("Edit Metadata: {}", movie.title))
+                .modal(true)
+                .transient_for(&window_clone)
+                .default_width(600)
+                .default_height(500)
+                .build();
+            
+            let content = Box::new(Orientation::Vertical, 12);
+            content.set_margin_start(20);
+            content.set_margin_end(20);
+            content.set_margin_top(20);
+            content.set_margin_bottom(20);
+            
+            let scroll = ScrolledWindow::new();
+            scroll.set_vexpand(true);
+            
+            let grid = Grid::new();
+            grid.set_row_spacing(12);
+            grid.set_column_spacing(12);
+            
+            // Title
+            grid.attach(&Label::new(Some("Title:")), 0, 0, 1, 1);
+            let title_entry = Entry::new();
+            title_entry.set_text(&movie.title);
+            title_entry.set_hexpand(true);
+            grid.attach(&title_entry, 1, 0, 1, 1);
+            
+            // Year
+            grid.attach(&Label::new(Some("Year:")), 0, 1, 1, 1);
+            let year_entry = Entry::new();
+            year_entry.set_text(&movie.year.to_string());
+            grid.attach(&year_entry, 1, 1, 1, 1);
+            
+            // Director
+            grid.attach(&Label::new(Some("Director:")), 0, 2, 1, 1);
+            let director_entry = Entry::new();
+            director_entry.set_text(&movie.director);
+            director_entry.set_hexpand(true);
+            grid.attach(&director_entry, 1, 2, 1, 1);
+            
+            // Genre
+            grid.attach(&Label::new(Some("Genre:")), 0, 3, 1, 1);
+            let genre_entry = Entry::new();
+            genre_entry.set_text(&movie.genre.join(", "));
+            genre_entry.set_hexpand(true);
+            grid.attach(&genre_entry, 1, 3, 1, 1);
+            
+            // Rating
+            grid.attach(&Label::new(Some("Rating (0-10):")), 0, 4, 1, 1);
+            let rating_entry = Entry::new();
+            rating_entry.set_text(&format!("{:.1}", movie.rating));
+            grid.attach(&rating_entry, 1, 4, 1, 1);
+            
+            // Runtime
+            grid.attach(&Label::new(Some("Runtime (min):")), 0, 5, 1, 1);
+            let runtime_entry = Entry::new();
+            runtime_entry.set_text(&movie.runtime.to_string());
+            grid.attach(&runtime_entry, 1, 5, 1, 1);
+            
+            // Description
+            grid.attach(&Label::new(Some("Description:")), 0, 6, 1, 1);
+            let desc_text_view = gtk::TextView::new();
+            desc_text_view.buffer().set_text(&movie.description);
+            desc_text_view.set_wrap_mode(gtk::WrapMode::Word);
+            desc_text_view.set_height_request(100);
+            let desc_scroll = ScrolledWindow::new();
+            desc_scroll.set_child(Some(&desc_text_view));
+            desc_scroll.set_vexpand(true);
+            grid.attach(&desc_scroll, 1, 6, 1, 1);
+            
+            // Cast
+            grid.attach(&Label::new(Some("Cast (comma-separated):")), 0, 7, 1, 1);
+            let cast_entry = Entry::new();
+            cast_entry.set_text(&movie.cast.join(", "));
+            cast_entry.set_hexpand(true);
+            grid.attach(&cast_entry, 1, 7, 1, 1);
+            
+            scroll.set_child(Some(&grid));
+            content.append(&scroll);
+            
+            let button_box = Box::new(Orientation::Horizontal, 8);
+            button_box.set_halign(Align::End);
+            let cancel_button = Button::with_label("Cancel");
+            let save_button = Button::with_label("Save Changes");
+            button_box.append(&cancel_button);
+            button_box.append(&save_button);
+            content.append(&button_box);
+            
+            dialog.set_child(Some(&content));
+            
+            let dialog_clone = dialog.clone();
+            cancel_button.connect_clicked(move |_| {
+                dialog_clone.close();
+            });
+            
+            let dialog_clone = dialog.clone();
+            let db_clone2 = db_clone.clone();
+            let details_label_clone2 = details_label_clone.clone();
+            let list_box_clone2 = list_box_clone.clone();
+            let status_bar_clone2 = status_bar_clone.clone();
+            save_button.connect_clicked(move |_| {
+                // Parse and validate inputs
+                let new_title = title_entry.text().to_string();
+                let new_year: u16 = year_entry.text().parse().unwrap_or(movie.year);
+                let new_director = director_entry.text().to_string();
+                let new_genre: Vec<String> = genre_entry.text()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let new_rating: f32 = rating_entry.text().parse().unwrap_or(movie.rating).clamp(0.0, 10.0);
+                let new_runtime: u16 = runtime_entry.text().parse().unwrap_or(movie.runtime);
+                
+                let buffer = desc_text_view.buffer();
+                let new_description = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+                
+                let new_cast: Vec<String> = cast_entry.text()
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                
+                // Update movie
+                let mut db = db_clone2.borrow_mut();
+                if let Some(existing_movie) = db.movies.get_mut(&movie_id) {
+                    existing_movie.title = new_title;
+                    existing_movie.year = new_year;
+                    existing_movie.director = new_director;
+                    existing_movie.genre = if new_genre.is_empty() { vec!["Unknown".to_string()] } else { new_genre };
+                    existing_movie.rating = new_rating;
+                    existing_movie.runtime = new_runtime;
+                    existing_movie.description = new_description;
+                    existing_movie.cast = new_cast;
+                }
+                drop(db);
+                
+                db_clone2.borrow_mut().save_to_file();
+                
+                // Refresh UI
+                let db = db_clone2.borrow();
+                if let Some(updated_movie) = db.movies.get(&movie_id) {
+                    let escaped_title = escape_markup(&updated_movie.title);
+                    let escaped_director = escape_markup(&updated_movie.director);
+                    let escaped_genre = escape_markup(&updated_movie.genre.join(", "));
+                    let escaped_description = escape_markup(&updated_movie.description);
+                    let escaped_file = escape_markup(&updated_movie.file_path);
+                    
+                    let cast_display = if !updated_movie.cast_details.is_empty() {
+                        let cast_list: Vec<String> = updated_movie.cast_details.iter()
+                            .map(|cm| {
+                                let name = escape_markup(&cm.name);
+                                let character = escape_markup(&cm.character);
+                                format!("{} ({})", name, character)
+                            })
+                            .collect();
+                        cast_list.join("\n    • ")
+                    } else if !updated_movie.cast.is_empty() {
+                        let cast_list: Vec<String> = updated_movie.cast.iter()
+                            .map(|name| escape_markup(name))
+                            .collect();
+                        cast_list.join("\n    • ")
+                    } else {
+                        String::from("Unknown")
+                    };
+                    
+                    let imdb_display = if !updated_movie.imdb_id.is_empty() {
+                        format!("{} (https://www.imdb.com/title/{})", updated_movie.imdb_id, updated_movie.imdb_id)
+                    } else {
+                        String::from("Not available")
+                    };
+                    
+                    let details = format!(
+                        "<b>{}</b> ({})\n\n\
+                        <b>Director:</b> {}\n\
+                        <b>Genre:</b> {}\n\
+                        <b>Rating:</b> ⭐ {:.1}/10\n\
+                        <b>Runtime:</b> {} minutes\n\n\
+                        <b>Starring:</b>\n    • {}\n\n\
+                        <b>Description:</b>\n{}\n\n\
+                        <b>File:</b> {}\n\
+                        <b>TMDB ID:</b> {}\n\
+                        <b>IMDb ID:</b> {}",
+                        escaped_title, updated_movie.year, escaped_director,
+                        escaped_genre, updated_movie.rating, updated_movie.runtime,
+                        cast_display, escaped_description, escaped_file,
+                        updated_movie.tmdb_id, imdb_display
+                    );
+                    details_label_clone2.set_markup(&details);
+                }
+                drop(db);
+                
+                // Refresh movie list
+                while let Some(child) = list_box_clone2.first_child() {
+                    list_box_clone2.remove(&child);
+                }
+                let movies = db_clone2.borrow().list_all();
+                for movie in &movies {
+                    let row = create_movie_row(movie);
+                    list_box_clone2.append(&row);
+                }
+                
+                status_bar_clone2.set_text("Movie metadata updated");
+                dialog_clone.close();
+            });
+            
+            dialog.present();
+        }
+    });
+    
     // Select Different Version button - search TMDB and let user choose
     let window_clone = window.clone();
     let db_clone = db.clone();
