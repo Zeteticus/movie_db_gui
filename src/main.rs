@@ -565,7 +565,7 @@ fn scan_directory_recursive(
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Movie Database Manager")
+        .title("Mark's Movie Database (MMDB)")
         .default_width(1000)
         .default_height(700)
         .build();
@@ -588,19 +588,21 @@ fn build_ui(app: &Application) {
     header.set_margin_top(12);
     header.set_margin_bottom(12);
 
-    let title_label = Label::new(Some("🎬 Movie Database"));
-    title_label.set_markup("<span size='x-large' weight='bold'>🎬 Movie Database</span>");
+    let title_label = Label::new(Some("📽️ Mark's Movie Database"));
+    title_label.set_markup("<span size='x-large' weight='bold'>📽️ Mark's Movie Database</span>");
     
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
     let select_version_button = Button::with_label("🎞️ Wrong Movie?");
+    let stats_button = Button::with_label("📊 Statistics");
     let settings_button = Button::with_label("⚙️ Settings");
     
     header.append(&title_label);
     header.append(&Box::new(Orientation::Horizontal, 0));
     header.set_hexpand(true);
     title_label.set_hexpand(true);
+    header.append(&stats_button);
     header.append(&settings_button);
     header.append(&select_version_button);
     header.append(&refresh_button);
@@ -632,9 +634,15 @@ fn build_ui(app: &Application) {
     let genre_dropdown = DropDown::new(Some(genres), None::<gtk::Expression>);
     genre_dropdown.set_selected(0);
 
+    let sort_options = StringList::new(&["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"]);
+    let sort_dropdown = DropDown::new(Some(sort_options), None::<gtk::Expression>);
+    sort_dropdown.set_selected(0);
+
     search_box.append(&search_entry);
     search_box.append(&Label::new(Some("Genre:")));
     search_box.append(&genre_dropdown);
+    search_box.append(&Label::new(Some("Sort:")));
+    search_box.append(&sort_dropdown);
     main_box.append(&search_box);
 
     let scrolled = ScrolledWindow::new();
@@ -869,56 +877,108 @@ fn build_ui(app: &Application) {
         });
     }
 
+    // Helper function to refresh list with current filters and sorting
+    fn refresh_movie_list(
+        list_box: &ListBox,
+        db: &Rc<RefCell<MovieDatabase>>,
+        search_query: &str,
+        genre_filter: &str,
+        sort_by: &str,
+    ) {
+        while let Some(child) = list_box.first_child() {
+            list_box.remove(&child);
+        }
+
+        let mut results = if search_query.is_empty() {
+            db.borrow().search_by_genre(genre_filter)
+        } else {
+            db.borrow().search_by_title(search_query)
+        };
+        
+        // Apply sorting
+        match sort_by {
+            "Title (A-Z)" => {
+                results.sort_by(|a, b| a.title.cmp(&b.title));
+            }
+            "Year (Newest)" => {
+                results.sort_by(|a, b| b.year.cmp(&a.year));
+            }
+            "Year (Oldest)" => {
+                results.sort_by(|a, b| a.year.cmp(&b.year));
+            }
+            "Rating (High-Low)" => {
+                results.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            "Rating (Low-High)" => {
+                results.sort_by(|a, b| a.rating.partial_cmp(&b.rating).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            "Date Added (Newest)" => {
+                results.sort_by(|a, b| b.id.cmp(&a.id));
+            }
+            "Date Added (Oldest)" => {
+                results.sort_by(|a, b| a.id.cmp(&b.id));
+            }
+            _ => {}
+        }
+
+        for movie in &results {
+            let row = create_movie_row(movie);
+            list_box.append(&row);
+        }
+    }
+
     // Search functionality
     let list_box_clone = list_box.clone();
     let db_clone = db.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
+    let sort_dropdown_clone = sort_dropdown.clone();
     search_entry.connect_search_changed(move |entry| {
         let query = entry.text();
         let selected_idx = genre_dropdown_clone.selected();
-        let genres = ["All", "Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Thriller", "Romance"];
+        let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
-        while let Some(child) = list_box_clone.first_child() {
-            list_box_clone.remove(&child);
-        }
-
-        let results = if query.is_empty() {
-            db_clone.borrow().search_by_genre(selected_genre)
-        } else {
-            db_clone.borrow().search_by_title(&query.to_string())
-        };
-
-        for movie in &results {
-            let row = create_movie_row(movie);
-            list_box_clone.append(&row);
-        }
+        let sort_idx = sort_dropdown_clone.selected();
+        let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
+        let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
+        
+        refresh_movie_list(&list_box_clone, &db_clone, &query.to_string(), selected_genre, sort_by);
     });
 
     // Genre filter
     let list_box_clone = list_box.clone();
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
+    let sort_dropdown_clone = sort_dropdown.clone();
     genre_dropdown.connect_selected_notify(move |dropdown| {
         let selected_idx = dropdown.selected();
-        let genres = ["All", "Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Thriller", "Romance"];
+        let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
-        while let Some(child) = list_box_clone.first_child() {
-            list_box_clone.remove(&child);
-        }
-
         let query = search_entry_clone.text().to_string();
-        let results = if query.is_empty() {
-            db_clone.borrow().search_by_genre(selected_genre)
-        } else {
-            db_clone.borrow().search_by_title(&query)
-        };
-
-        for movie in &results {
-            let row = create_movie_row(movie);
-            list_box_clone.append(&row);
-        }
+        let sort_idx = sort_dropdown_clone.selected();
+        let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
+        let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
+        
+        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by);
+    });
+    
+    // Sort dropdown
+    let list_box_clone = list_box.clone();
+    let db_clone = db.clone();
+    let search_entry_clone = search_entry.clone();
+    let genre_dropdown_clone = genre_dropdown.clone();
+    sort_dropdown.connect_selected_notify(move |dropdown| {
+        let sort_idx = dropdown.selected();
+        let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
+        let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
+        
+        let query = search_entry_clone.text().to_string();
+        let selected_idx = genre_dropdown_clone.selected();
+        let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
+        let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
+        
+        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by);
     });
 
     // Movie selection
@@ -2176,6 +2236,164 @@ fn build_ui(app: &Application) {
         });
 
         dialog.present();
+    });
+
+    
+    // Statistics button
+    let db_clone = db.clone();
+    let window_clone = window.clone();
+    stats_button.connect_clicked(move |_| {
+        let db = db_clone.borrow();
+        let movies = db.list_all();
+        
+        if movies.is_empty() {
+            drop(db);
+            let dialog = gtk::AlertDialog::builder()
+                .message("No Statistics Available")
+                .detail("Add some movies to your database first!")
+                .buttons(vec!["OK"])
+                .build();
+            dialog.show(Some(&window_clone));
+            return;
+        }
+        
+        // Calculate statistics
+        let total_movies = movies.len();
+        let total_runtime: u32 = movies.iter().map(|m| m.runtime as u32).sum();
+        let avg_runtime = if total_movies > 0 { total_runtime / total_movies as u32 } else { 0 };
+        
+        let avg_rating: f32 = if total_movies > 0 {
+            movies.iter().map(|m| m.rating).sum::<f32>() / total_movies as f32
+        } else {
+            0.0
+        };
+        
+        let oldest_year = movies.iter().filter(|m| m.year > 0).map(|m| m.year).min().unwrap_or(0);
+        let newest_year = movies.iter().map(|m| m.year).max().unwrap_or(0);
+        
+        // Genre breakdown
+        let mut genre_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for movie in &movies {
+            for genre in &movie.genre {
+                *genre_counts.entry(genre.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut genre_list: Vec<(String, usize)> = genre_counts.into_iter().collect();
+        genre_list.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        // Decade breakdown
+        let mut decade_counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
+        for movie in &movies {
+            if movie.year > 0 {
+                let decade = (movie.year / 10) * 10;
+                *decade_counts.entry(decade).or_insert(0) += 1;
+            }
+        }
+        let mut decade_list: Vec<(u16, usize)> = decade_counts.into_iter().collect();
+        decade_list.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Top rated movies
+        let mut top_rated = movies.clone();
+        top_rated.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
+        let top_100: Vec<String> = top_rated.iter()
+            .take(100)
+            .map(|m| format!("{} ({}) - ⭐ {:.1}", m.title, m.year, m.rating))
+            .collect();
+        
+        drop(db);
+        
+        // Create statistics dialog
+        let stats_dialog = Window::builder()
+            .title("📊 Database Statistics")
+            .modal(true)
+            .transient_for(&window_clone)
+            .default_width(600)
+            .default_height(500)
+            .build();
+        
+        let scroll = ScrolledWindow::new();
+        scroll.set_vexpand(true);
+        
+        let stats_box = Box::new(Orientation::Vertical, 12);
+        stats_box.set_margin_start(20);
+        stats_box.set_margin_end(20);
+        stats_box.set_margin_top(20);
+        stats_box.set_margin_bottom(20);
+        
+        // Overview section
+        let overview_label = Label::new(None);
+        overview_label.set_xalign(0.0);
+        overview_label.set_markup(&format!(
+            "<span size='large' weight='bold'>📊 Overview</span>\n\n\
+            <b>Total Movies:</b> {}\n\
+            <b>Average Rating:</b> ⭐ {:.2}/10\n\
+            <b>Total Runtime:</b> {} hours ({} minutes)\n\
+            <b>Average Runtime:</b> {} minutes\n\
+            <b>Year Range:</b> {} - {}",
+            total_movies,
+            avg_rating,
+            total_runtime / 60,
+            total_runtime,
+            avg_runtime,
+            oldest_year,
+            newest_year
+        ));
+        stats_box.append(&overview_label);
+        stats_box.append(&Separator::new(Orientation::Horizontal));
+        
+        // Top rated section
+        let top_rated_label = Label::new(None);
+        top_rated_label.set_xalign(0.0);
+        top_rated_label.set_markup(&format!(
+            "<span size='large' weight='bold'>🏆 Top 100 Rated Movies</span>\n\n{}",
+            top_100.join("\n")
+        ));
+        stats_box.append(&top_rated_label);
+        stats_box.append(&Separator::new(Orientation::Horizontal));
+        
+        // Genre breakdown
+        let genre_text = genre_list.iter()
+            .take(10)
+            .map(|(genre, count)| format!("<b>{}:</b> {} movies", genre, count))
+            .collect::<Vec<String>>()
+            .join("\n");
+        
+        let genre_label = Label::new(None);
+        genre_label.set_xalign(0.0);
+        genre_label.set_markup(&format!(
+            "<span size='large' weight='bold'>🎭 Top Genres</span>\n\n{}",
+            genre_text
+        ));
+        stats_box.append(&genre_label);
+        stats_box.append(&Separator::new(Orientation::Horizontal));
+        
+        // Decade breakdown
+        let decade_text = decade_list.iter()
+            .map(|(decade, count)| format!("<b>{}s:</b> {} movies", decade, count))
+            .collect::<Vec<String>>()
+            .join("\n");
+        
+        let decade_label = Label::new(None);
+        decade_label.set_xalign(0.0);
+        decade_label.set_markup(&format!(
+            "<span size='large' weight='bold'>📅 By Decade</span>\n\n{}",
+            decade_text
+        ));
+        stats_box.append(&decade_label);
+        
+        // Close button
+        let close_button = Button::with_label("Close");
+        close_button.set_halign(Align::End);
+        stats_box.append(&close_button);
+        
+        let stats_dialog_clone = stats_dialog.clone();
+        close_button.connect_clicked(move |_| {
+            stats_dialog_clone.close();
+        });
+        
+        scroll.set_child(Some(&stats_box));
+        stats_dialog.set_child(Some(&scroll));
+        stats_dialog.present();
     });
 
     window.present();
