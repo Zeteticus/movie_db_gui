@@ -14,7 +14,7 @@ use gtk::gdk_pixbuf::Pixbuf;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::{File, read_dir, create_dir_all};
-use std::io::{BufRead, BufReader, Write, Read};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::process::{Command, Stdio};
@@ -178,11 +178,36 @@ struct TMDBExternalIds {
     imdb_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
 struct MovieDatabase {
     movies: HashMap<u32, Movie>,
     next_id: u32,
+    #[serde(skip)]  // Don't serialize file path
     data_file: String,
     tmdb_api_key: String,
+    #[serde(default)]
+    tmdb_cache: HashMap<String, CachedTMDBSearch>,  // search_query -> cached results
+    #[serde(skip)]  // Don't serialize pixbufs (can't serialize)
+    poster_cache: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> cached pixbuf
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedTMDBSearch {
+    query: String,
+    results: Vec<(u32, String, String, f32)>,  // (tmdb_id, title, year, rating)
+    timestamp: u64,  // Unix timestamp
+}
+
+impl CachedTMDBSearch {
+    fn is_expired(&self, max_age_days: u64) -> bool {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let age_days = (now - self.timestamp) / 86400;
+        age_days > max_age_days
+    }
 }
 
 fn download_poster(poster_url: &str, movie_id: u32) -> Option<String> {
@@ -335,6 +360,8 @@ impl MovieDatabase {
             next_id: 1,
             data_file: data_file.to_string(),
             tmdb_api_key: api_key.to_string(),
+            tmdb_cache: HashMap::new(),
+            poster_cache: Rc::new(RefCell::new(HashMap::new())),
         };
         db.load_from_file();
         db
@@ -378,11 +405,9 @@ impl MovieDatabase {
     }
 
     fn save_to_file(&self) {
-        let mut file = File::create(&self.data_file).expect("Unable to create file");
-        for movie in self.movies.values() {
-            let json = serde_json::to_string(movie).unwrap();
-            writeln!(file, "{}", json).expect("Unable to write to file");
-        }
+        // Serialize entire database to JSON (including cache)
+        let json = serde_json::to_string_pretty(&self).expect("Unable to serialize database");
+        std::fs::write(&self.data_file, json).expect("Unable to write to file");
     }
 
     fn load_from_file(&mut self) {
@@ -390,16 +415,29 @@ impl MovieDatabase {
             return;
         }
 
-        let file = File::open(&self.data_file).expect("Unable to open file");
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                if let Ok(movie) = serde_json::from_str::<Movie>(&line) {
-                    let id = movie.id;
-                    self.movies.insert(id, movie);
-                    if id >= self.next_id {
-                        self.next_id = id + 1;
+        // Try to load new format (entire database as JSON)
+        if let Ok(contents) = std::fs::read_to_string(&self.data_file) {
+            if let Ok(loaded_db) = serde_json::from_str::<MovieDatabase>(&contents) {
+                // Successfully loaded new format
+                self.movies = loaded_db.movies;
+                self.next_id = loaded_db.next_id;
+                self.tmdb_api_key = loaded_db.tmdb_api_key;
+                self.tmdb_cache = loaded_db.tmdb_cache;
+                return;
+            }
+        }
+        
+        // Fall back to old format (line-by-line movies) for backwards compatibility
+        if let Ok(file) = File::open(&self.data_file) {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(line) = line {
+                    if let Ok(movie) = serde_json::from_str::<Movie>(&line) {
+                        let id = movie.id;
+                        self.movies.insert(id, movie);
+                        if id >= self.next_id {
+                            self.next_id = id + 1;
+                        }
                     }
                 }
             }
@@ -411,9 +449,39 @@ impl MovieDatabase {
         movies.sort_by(|a, b| a.title.cmp(&b.title));
         movies
     }
+    
+    // TMDB Cache methods
+    fn get_cached_search(&self, query: &str) -> Option<Vec<(u32, String, String, f32)>> {
+        let cache_max_age_days = 30;  // Cache expires after 30 days
+        
+        if let Some(cached) = self.tmdb_cache.get(query) {
+            if !cached.is_expired(cache_max_age_days) {
+                return Some(cached.results.clone());
+            }
+        }
+        None
+    }
+    
+    fn cache_search_results(&mut self, query: String, results: Vec<(u32, String, String, f32)>) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let cached = CachedTMDBSearch {
+            query: query.clone(),
+            results,
+            timestamp,
+        };
+        
+        self.tmdb_cache.insert(query, cached);
+        // Save to persist cache
+        self.save_to_file();
+    }
 }
 
-fn create_movie_row(movie: &Movie) -> gtk::ListBoxRow {
+fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     
     // Store the movie ID in the row's name property for later retrieval
@@ -430,10 +498,24 @@ fn create_movie_row(movie: &Movie) -> gtk::ListBoxRow {
     poster_box.set_size_request(60, 90);
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 60, 90, true) {
-            let picture = Picture::for_pixbuf(&pixbuf);
+        // Check cache first
+        let mut cache = poster_cache.borrow_mut();
+        
+        if let Some(pixbuf) = cache.get(&movie.id) {
+            // Use cached pixbuf (FAST!)
+            let picture = Picture::for_pixbuf(pixbuf);
             picture.set_can_shrink(true);
             poster_box.append(&picture);
+        } else {
+            // Load from disk and cache it
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 60, 90, true) {
+                // Cache for next time
+                cache.insert(movie.id, pixbuf.clone());
+                
+                let picture = Picture::for_pixbuf(&pixbuf);
+                picture.set_can_shrink(true);
+                poster_box.append(&picture);
+            }
         }
     } else {
         // Placeholder for missing poster
@@ -605,6 +687,9 @@ fn build_ui(app: &Application) {
     };
 
     let db = Rc::new(RefCell::new(MovieDatabase::new("movies.db", &api_key)));
+    
+    // Get poster cache reference for passing to create_movie_row
+    let poster_cache = db.borrow().poster_cache.clone();
 
     let main_box = Box::new(Orientation::Vertical, 0);
 
@@ -731,7 +816,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let movies = db_clone.borrow().list_all();
     for movie in &movies {
-        let row = create_movie_row(movie);
+        let row = create_movie_row(movie, &poster_cache);
         list_box.append(&row);
     }
 
@@ -742,6 +827,7 @@ fn build_ui(app: &Application) {
         let list_box_clone = list_box.clone();
         let status_bar_clone = status_bar.clone();
         let window_clone = window.clone();
+        let poster_cache_clone = poster_cache.clone();
         
         // Ask user if they want to scan
         let dialog = gtk::AlertDialog::builder()
@@ -883,7 +969,7 @@ fn build_ui(app: &Application) {
                                 new_movies_count += 1;
                                 
                                 // Add to UI
-                                let row = create_movie_row(&movie);
+                                let row = create_movie_row(&movie, &poster_cache_clone);
                                 list_box_clone.append(&row);
                             }
                         }
@@ -915,7 +1001,9 @@ fn build_ui(app: &Application) {
         search_query: &str,
         genre_filter: &str,
         sort_by: &str,
+        poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
     ) {
+        // Clear existing rows
         while let Some(child) = list_box.first_child() {
             list_box.remove(&child);
         }
@@ -952,8 +1040,9 @@ fn build_ui(app: &Application) {
             _ => {}
         }
 
+        // Add rows with poster cache
         for movie in &results {
-            let row = create_movie_row(movie);
+            let row = create_movie_row(movie, poster_cache);
             list_box.append(&row);
         }
     }
@@ -963,6 +1052,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
+    let poster_cache_clone = poster_cache.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text();
         let selected_idx = genre_dropdown_clone.selected();
@@ -973,7 +1063,7 @@ fn build_ui(app: &Application) {
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query.to_string(), selected_genre, sort_by);
+        refresh_movie_list(&list_box_clone, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Genre filter
@@ -981,6 +1071,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
+    let poster_cache_clone = poster_cache.clone();
     genre_dropdown.connect_selected_notify(move |dropdown| {
         let selected_idx = dropdown.selected();
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
@@ -991,7 +1082,7 @@ fn build_ui(app: &Application) {
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by);
+        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
     });
     
     // Sort dropdown
@@ -999,6 +1090,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
+    let poster_cache_clone = poster_cache.clone();
     sort_dropdown.connect_selected_notify(move |dropdown| {
         let sort_idx = dropdown.selected();
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
@@ -1009,7 +1101,7 @@ fn build_ui(app: &Application) {
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by);
+        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Movie selection
@@ -1134,6 +1226,7 @@ fn build_ui(app: &Application) {
     let selected_movie_id_clone = selected_movie_id.clone();
     let details_label_clone = details_label.clone();
     let list_box_clone = list_box.clone();
+    let poster_cache_clone = poster_cache.clone();
     associate_file_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -1148,6 +1241,7 @@ fn build_ui(app: &Application) {
         let db_clone2 = db_clone.clone();
         let details_label_clone2 = details_label_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
+        let poster_cache_clone2 = poster_cache_clone.clone();
         file_dialog.open(Some(&window_clone), gtk::gio::Cancellable::NONE, move |result| {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
@@ -1218,7 +1312,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie);
+                            let row = create_movie_row(movie, &poster_cache_clone2);
                             list_box_clone2.append(&row);
                         }
                     }
@@ -1232,6 +1326,7 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let window_clone = window.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
+    let poster_cache_clone = poster_cache.clone();
     delete_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id > 0 {
@@ -1245,6 +1340,7 @@ fn build_ui(app: &Application) {
 
             let db_clone2 = db_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
+            let poster_cache_clone2 = poster_cache_clone.clone();
             dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
                 if let Ok(1) = response {
                     if db_clone2.borrow_mut().delete_movie(movie_id) {
@@ -1253,7 +1349,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie);
+                            let row = create_movie_row(movie, &poster_cache_clone2);
                             list_box_clone2.append(&row);
                         }
                     }
@@ -1412,6 +1508,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
+    let poster_cache_clone = poster_cache.clone();
     scan_button.connect_clicked(move |_| {
         let dialog = gtk::FileDialog::new();
         dialog.set_title("Select Movie Directory");
@@ -1419,7 +1516,7 @@ fn build_ui(app: &Application) {
         let db_clone2 = db_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
-        
+        let poster_cache_clone2 = poster_cache_clone.clone();
         dialog.select_folder(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |result| {
             if let Ok(folder) = result {
                 if let Some(path) = folder.path() {
@@ -1548,7 +1645,7 @@ fn build_ui(app: &Application) {
                                     }
                                     let movies = db_clone3.borrow().list_all();
                                     for movie in &movies {
-                                        let row = create_movie_row(movie);
+                                        let row = create_movie_row(movie, &poster_cache_clone2);
                                         list_box_clone3.append(&row);
                                     }
                                     status_bar_clone3.set_text("Scan complete!");
@@ -1568,12 +1665,14 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
     let status_bar_clone = status_bar.clone();
+    let poster_cache_clone = poster_cache.clone();
     refresh_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id > 0 {
             let db_clone2 = db_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
             let status_bar_clone2 = status_bar_clone.clone();
+            let poster_cache_clone2 = poster_cache_clone.clone();
             
             // Get the data we need before spawning thread
             let (title, file_path, api_key) = {
@@ -1710,7 +1809,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie);
+                            let row = create_movie_row(movie, &poster_cache_clone2);
                             list_box_clone2.append(&row);
                         }
                         status_bar_clone2.set_text("Metadata refreshed!");
@@ -1729,6 +1828,7 @@ fn build_ui(app: &Application) {
     let details_label_clone = details_label.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
+    let poster_cache_clone = poster_cache.clone();
     edit_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -1840,6 +1940,7 @@ fn build_ui(app: &Application) {
             let details_label_clone2 = details_label_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
             let status_bar_clone2 = status_bar_clone.clone();
+            let poster_cache_clone2 = poster_cache_clone.clone();
             save_button.connect_clicked(move |_| {
                 // Parse and validate inputs
                 let new_title = title_entry.text().to_string();
@@ -1937,7 +2038,7 @@ fn build_ui(app: &Application) {
                 }
                 let movies = db_clone2.borrow().list_all();
                 for movie in &movies {
-                    let row = create_movie_row(movie);
+                    let row = create_movie_row(movie, &poster_cache_clone2);
                     list_box_clone2.append(&row);
                 }
                 
@@ -1955,6 +2056,7 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
+    let poster_cache_clone_select = poster_cache.clone();
     select_version_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -2032,20 +2134,29 @@ fn build_ui(app: &Application) {
             
             let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
             
-            std::thread::spawn(move || {
-                // Search TMDB
-                let search_url = format!(
-                    "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-                    api_key,
-                    urlencoding::encode(&movie_title)
-                );
-                
-                if let Ok(response) = reqwest::blocking::get(&search_url) {
-                    if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
-                        let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
-                            // Show ALL results (TMDB returns up to 20 per page by default)
-                            .map(|r| {
-                                // Fetch basic details for each to get year
+            // Check cache first
+            let movie_title_for_cache = movie_title.clone();
+            let cached_results = db_clone2.borrow().get_cached_search(&movie_title_for_cache);
+            
+            if let Some(results) = cached_results {
+                // Use cached results immediately!
+                let _ = sender.send_blocking(results);
+            } else {
+                // Fetch from TMDB and cache
+                std::thread::spawn(move || {
+                    // Search TMDB
+                    let search_url = format!(
+                        "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                        api_key,
+                        urlencoding::encode(&movie_title)
+                    );
+                    
+                    if let Ok(response) = reqwest::blocking::get(&search_url) {
+                        if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
+                            let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
+                                // Show ALL results (TMDB returns up to 20 per page by default)
+                                .map(|r| {
+                                    // Fetch basic details for each to get year
                                 let details_url = format!(
                                     "https://api.themoviedb.org/3/movie/{}?api_key={}",
                                     r.id, api_key
@@ -2065,14 +2176,33 @@ fn build_ui(app: &Application) {
                             })
                             .collect();
                         
-                        let _ = sender.send_blocking(results);
+                        // Cache the results before sending
+                        let _ = sender.send_blocking(results.clone());
+                        
+                        // Cache asynchronously (don't block on save)
+                        std::thread::spawn(move || {
+                            // Need to get db reference in this thread
+                            // This will be handled when results are received
+                        });
                     }
                 }
             });
+            }
             
             // Update UI with results
+            let db_clone_for_cache = db_clone2.clone();
+            let movie_title_for_cache2 = movie_title_for_ui.clone();
+            let poster_cache_clone_select2 = poster_cache_clone_select.clone();
             glib::spawn_future_local(async move {
                 if let Ok(results) = receiver.recv().await {
+                    // Cache the results if not from cache
+                    if !results.is_empty() {
+                        db_clone_for_cache.borrow_mut().cache_search_results(
+                            movie_title_for_cache2.clone(),
+                            results.clone()
+                        );
+                    }
+                    
                     // Remove loading message
                     while let Some(child) = list_box_results_clone.first_child() {
                         list_box_results_clone.remove(&child);
@@ -2235,6 +2365,7 @@ fn build_ui(app: &Application) {
                                     let _ = sender2.send_blocking(None);
                                 });
                                 
+                                let poster_cache_clone_select3 = poster_cache_clone_select2.clone();
                                 glib::spawn_future_local(async move {
                                     if let Ok(Some((old_id, new_movie))) = receiver2.recv().await {
                                         db_clone3.borrow_mut().delete_movie(old_id);
@@ -2247,7 +2378,7 @@ fn build_ui(app: &Application) {
                                         
                                         let movies = db_clone3.borrow().list_all();
                                         for movie in &movies {
-                                            let row = create_movie_row(movie);
+                                            let row = create_movie_row(movie, &poster_cache_clone_select3);
                                             list_box_clone3.append(&row);
                                         }
                                         
@@ -2269,6 +2400,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
+    let poster_cache_clone_add = poster_cache.clone();
     add_button.connect_clicked(move |_| {
         let dialog = Window::builder()
             .title("Add New Movie")
@@ -2351,6 +2483,7 @@ fn build_ui(app: &Application) {
         let db_clone2 = db_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
+        let poster_cache_clone_add2 = poster_cache_clone_add.clone();
         search_btn.connect_clicked(move |_| {
             let search_title = title_entry.text().to_string();
             let selected_file_path = file_entry.text().to_string();
@@ -2429,31 +2562,40 @@ fn build_ui(app: &Application) {
                 
                 let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
                 
-                std::thread::spawn(move || {
-                    // Search TMDB
-                    let search_url = format!(
-                        "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-                        api_key,
-                        urlencoding::encode(&search_title)
-                    );
-                    
-                    if let Ok(response) = reqwest::blocking::get(&search_url) {
-                        if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
-                            let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
-                                // Show ALL results (up to 20)
-                                .map(|r| {
-                                    let details_url = format!(
-                                        "https://api.themoviedb.org/3/movie/{}?api_key={}",
-                                        r.id, api_key
-                                    );
-                                    
-                                    if let Ok(details_response) = reqwest::blocking::get(&details_url) {
-                                        if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
-                                            let year = details.release_date
-                                                .split('-')
-                                                .next()
-                                                .and_then(|y| y.parse().ok())
-                                                .unwrap_or(0);
+                // Check cache first
+                let search_title_for_cache = search_title.clone();
+                let cached_results = db_clone3.borrow().get_cached_search(&search_title_for_cache);
+                
+                if let Some(results) = cached_results {
+                    // Use cached results immediately!
+                    let _ = sender.send_blocking(results);
+                } else {
+                    // Fetch from TMDB
+                    std::thread::spawn(move || {
+                        // Search TMDB
+                        let search_url = format!(
+                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                            api_key,
+                            urlencoding::encode(&search_title)
+                        );
+                        
+                        if let Ok(response) = reqwest::blocking::get(&search_url) {
+                            if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
+                                let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
+                                    // Show ALL results (up to 20)
+                                    .map(|r| {
+                                        let details_url = format!(
+                                            "https://api.themoviedb.org/3/movie/{}?api_key={}",
+                                            r.id, api_key
+                                        );
+                                        
+                                        if let Ok(details_response) = reqwest::blocking::get(&details_url) {
+                                            if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
+                                                let year = details.release_date
+                                                    .split('-')
+                                                    .next()
+                                                    .and_then(|y| y.parse().ok())
+                                                    .unwrap_or(0);
                                             return (r.id, details.title, year.to_string(), details.vote_average);
                                         }
                                     }
@@ -2464,11 +2606,23 @@ fn build_ui(app: &Application) {
                             let _ = sender.send_blocking(results);
                         }
                     }
-                });
+                    });
+                }
                 
                 // Update UI with results
+                let db_clone_for_cache = db_clone3.clone();
+                let search_title_for_cache2 = search_title_for_ui.clone();
+                let poster_cache_clone_add3 = poster_cache_clone_add2.clone();
                 glib::spawn_future_local(async move {
                     if let Ok(results) = receiver.recv().await {
+                        // Cache the results if not from cache
+                        if !results.is_empty() {
+                            db_clone_for_cache.borrow_mut().cache_search_results(
+                                search_title_for_cache2.clone(),
+                                results.clone()
+                            );
+                        }
+                        
                         // Remove loading message
                         while let Some(child) = list_box_results_clone.first_child() {
                             list_box_results_clone.remove(&child);
@@ -2629,11 +2783,12 @@ fn build_ui(app: &Application) {
                                         let _ = sender2.send_blocking(None);
                                     });
                                     
+                                    let poster_cache_clone_add4 = poster_cache_clone_add3.clone();
                                     glib::spawn_future_local(async move {
                                         if let Ok(Some((title, movie))) = receiver2.recv().await {
                                             db_clone4.borrow_mut().add_movie(movie.clone());
                                             
-                                            let row = create_movie_row(&movie);
+                                            let row = create_movie_row(&movie, &poster_cache_clone_add4);
                                             list_box_clone4.append(&row);
                                             
                                             status_bar_clone4.set_text(&format!("Added: {}", title));
