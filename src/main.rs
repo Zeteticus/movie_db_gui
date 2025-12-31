@@ -619,6 +619,7 @@ fn build_ui(app: &Application) {
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
+    let edit_button = Button::with_label("✏️ Edit Metadata");
     let select_version_button = Button::with_label("🎞️ Wrong Movie?");
     let stats_button = Button::with_label("📊 Statistics");
     let settings_button = Button::with_label("⚙️ Settings");
@@ -629,6 +630,7 @@ fn build_ui(app: &Application) {
     title_label.set_hexpand(true);
     header.append(&stats_button);
     header.append(&settings_button);
+    header.append(&edit_button);
     header.append(&select_version_button);
     header.append(&refresh_button);
     header.append(&scan_button);
@@ -710,9 +712,11 @@ fn build_ui(app: &Application) {
     let action_box = Box::new(Orientation::Horizontal, 8);
     let play_button = Button::with_label("▶️ Play in VLC");
     let show_cast_button = Button::with_label("⭐ Show Cast");
+    let associate_file_button = Button::with_label("📎 Associate File");
     let delete_button = Button::with_label("🗑️ Delete");
     action_box.append(&play_button);
     action_box.append(&show_cast_button);
+    action_box.append(&associate_file_button);
     action_box.append(&delete_button);
     details_box.append(&action_box);
 
@@ -1123,6 +1127,105 @@ fn build_ui(app: &Application) {
         }
     });
 
+    // Associate File button
+    let db_clone = db.clone();
+    let window_clone = window.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    let details_label_clone = details_label.clone();
+    let list_box_clone = list_box.clone();
+    associate_file_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id == 0 {
+            return;
+        }
+        
+        let file_dialog = gtk::FileDialog::builder()
+            .title("Select Movie File")
+            .modal(true)
+            .build();
+        
+        let db_clone2 = db_clone.clone();
+        let details_label_clone2 = details_label_clone.clone();
+        let list_box_clone2 = list_box_clone.clone();
+        file_dialog.open(Some(&window_clone), gtk::gio::Cancellable::NONE, move |result| {
+            if let Ok(file) = result {
+                if let Some(path) = file.path() {
+                    let file_path = path.to_string_lossy().to_string();
+                    
+                    // Update movie with new file path
+                    let mut db = db_clone2.borrow_mut();
+                    if let Some(movie) = db.movies.get_mut(&movie_id) {
+                        movie.file_path = file_path.clone();
+                        drop(db); // Release borrow
+                        db_clone2.borrow_mut().save_to_file();
+                        
+                        // Refresh details display
+                        let db = db_clone2.borrow();
+                        if let Some(updated_movie) = db.movies.get(&movie_id) {
+                            let escaped_title = escape_markup(&updated_movie.title);
+                            let escaped_director = escape_markup(&updated_movie.director);
+                            let escaped_genre = escape_markup(&updated_movie.genre.join(", "));
+                            let escaped_description = escape_markup(&updated_movie.description);
+                            let escaped_file = escape_markup(&updated_movie.file_path);
+                            
+                            let cast_display = if !updated_movie.cast_details.is_empty() {
+                                let cast_list: Vec<String> = updated_movie.cast_details.iter()
+                                    .map(|cm| {
+                                        let name = escape_markup(&cm.name);
+                                        let character = escape_markup(&cm.character);
+                                        format!("{} ({})", name, character)
+                                    })
+                                    .collect();
+                                cast_list.join("\n    • ")
+                            } else if !updated_movie.cast.is_empty() {
+                                let cast_list: Vec<String> = updated_movie.cast.iter()
+                                    .map(|name| escape_markup(name))
+                                    .collect();
+                                cast_list.join("\n    • ")
+                            } else {
+                                String::from("Unknown")
+                            };
+                            
+                            let imdb_display = if !updated_movie.imdb_id.is_empty() {
+                                format!("{} (https://www.imdb.com/title/{})", updated_movie.imdb_id, updated_movie.imdb_id)
+                            } else {
+                                String::from("Not available")
+                            };
+                            
+                            let details = format!(
+                                "<b>{}</b> ({})\n\n\
+                                <b>Director:</b> {}\n\
+                                <b>Genre:</b> {}\n\
+                                <b>Rating:</b> ⭐ {:.1}/10\n\
+                                <b>Runtime:</b> {} minutes\n\n\
+                                <b>Starring:</b>\n    • {}\n\n\
+                                <b>Description:</b>\n{}\n\n\
+                                <b>File:</b> {}\n\
+                                <b>TMDB ID:</b> {}\n\
+                                <b>IMDb ID:</b> {}",
+                                escaped_title, updated_movie.year, escaped_director,
+                                escaped_genre, updated_movie.rating, updated_movie.runtime,
+                                cast_display, escaped_description, escaped_file,
+                                updated_movie.tmdb_id, imdb_display
+                            );
+                            details_label_clone2.set_markup(&details);
+                        }
+                        
+                        // Refresh movie list
+                        while let Some(child) = list_box_clone2.first_child() {
+                            list_box_clone2.remove(&child);
+                        }
+                        let movies = db_clone2.borrow().list_all();
+                        for movie in &movies {
+                            let row = create_movie_row(movie);
+                            list_box_clone2.append(&row);
+                        }
+                    }
+                }
+            }
+        });
+    });
+    
     // Delete button
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
@@ -1634,6 +1737,7 @@ fn build_ui(app: &Application) {
         let db = db_clone.borrow();
         if let Some(movie) = db.movies.get(&movie_id) {
             let movie_title = movie.title.clone();
+            let movie_title_for_ui = movie_title.clone(); // Clone for UI updates
             let file_path = movie.file_path.clone();
             let api_key = db.tmdb_api_key.clone();
             drop(db); // Release borrow
@@ -1656,6 +1760,8 @@ fn build_ui(app: &Application) {
             let instruction = Label::new(Some(&format!("Select the correct version of \"{}\":", movie_title)));
             instruction.set_xalign(0.0);
             dialog_box.append(&instruction);
+            
+            let instruction_clone = instruction.clone();
             
             let scroll = ScrolledWindow::new();
             scroll.set_vexpand(true);
@@ -1709,7 +1815,7 @@ fn build_ui(app: &Application) {
                 if let Ok(response) = reqwest::blocking::get(&search_url) {
                     if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
                         let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
-                            .take(10) // Show top 10 results
+                            // Show ALL results (TMDB returns up to 20 per page by default)
                             .map(|r| {
                                 // Fetch basic details for each to get year
                                 let details_url = format!(
@@ -1751,6 +1857,12 @@ fn build_ui(app: &Application) {
                         list_box_results_clone.append(&no_results_row);
                         return;
                     }
+                    
+                    // Update instruction with result count
+                    instruction_clone.set_text(&format!(
+                        "Select the correct version of \"{}\" ({} results found):",
+                        movie_title_for_ui, results.len()
+                    ));
                     
                     // Add result rows
                     for (tmdb_id, title, year, rating) in &results {
@@ -1954,15 +2066,49 @@ fn build_ui(app: &Application) {
 
         grid.attach(&Label::new(Some("Title:")), 0, 0, 1, 1);
         grid.attach(&title_entry, 1, 0, 1, 1);
+        
+        // Optional file path
+        let file_label = Label::new(Some("File (optional):"));
+        let file_entry = Entry::new();
+        file_entry.set_placeholder_text(Some("No file selected"));
+        file_entry.set_editable(false);
+        file_entry.set_hexpand(true);
+        
+        let browse_btn = Button::with_label("Browse...");
+        let file_box = Box::new(Orientation::Horizontal, 4);
+        file_box.append(&file_entry);
+        file_box.append(&browse_btn);
+        
+        grid.attach(&file_label, 0, 1, 1, 1);
+        grid.attach(&file_box, 1, 1, 1, 1);
 
         content.append(&grid);
+        
+        // File picker dialog
+        let file_entry_clone = file_entry.clone();
+        let window_clone2 = window_clone.clone();
+        browse_btn.connect_clicked(move |_| {
+            let file_dialog = gtk::FileDialog::builder()
+                .title("Select Movie File")
+                .modal(true)
+                .build();
+            
+            let file_entry_clone2 = file_entry_clone.clone();
+            file_dialog.open(Some(&window_clone2), gtk::gio::Cancellable::NONE, move |result| {
+                if let Ok(file) = result {
+                    if let Some(path) = file.path() {
+                        file_entry_clone2.set_text(&path.to_string_lossy());
+                    }
+                }
+            });
+        });
 
         let button_box = Box::new(Orientation::Horizontal, 8);
         button_box.set_halign(gtk::Align::End);
         let cancel_btn = Button::with_label("Cancel");
-        let add_btn = Button::with_label("Search & Add");
+        let search_btn = Button::with_label("Search");
         button_box.append(&cancel_btn);
-        button_box.append(&add_btn);
+        button_box.append(&search_btn);
         content.append(&button_box);
 
         dialog.set_child(Some(&content));
@@ -1973,153 +2119,303 @@ fn build_ui(app: &Application) {
         });
 
         let dialog_clone = dialog.clone();
+        let window_clone2 = window_clone.clone();
         let db_clone2 = db_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
-        add_btn.connect_clicked(move |_| {
-            let title = title_entry.text().to_string();
-            if !title.is_empty() {
+        search_btn.connect_clicked(move |_| {
+            let search_title = title_entry.text().to_string();
+            let selected_file_path = file_entry.text().to_string();
+            let file_path_to_use = if selected_file_path.is_empty() || selected_file_path == "No file selected" {
+                String::new()
+            } else {
+                selected_file_path
+            };
+            
+            if !search_title.is_empty() {
                 dialog_clone.close();
                 
+                // Create selection dialog
+                let selection_dialog = Window::builder()
+                    .title(&format!("Select Movie: {}", search_title))
+                    .modal(true)
+                    .transient_for(&window_clone2)
+                    .default_width(600)
+                    .default_height(400)
+                    .build();
+                
+                let dialog_box = Box::new(Orientation::Vertical, 12);
+                dialog_box.set_margin_start(20);
+                dialog_box.set_margin_end(20);
+                dialog_box.set_margin_top(20);
+                dialog_box.set_margin_bottom(20);
+                
+                let instruction = Label::new(Some(&format!("Select the movie to add for \"{}\":", search_title)));
+                instruction.set_xalign(0.0);
+                dialog_box.append(&instruction);
+                
+                let instruction_clone = instruction.clone();
+                
+                let scroll = ScrolledWindow::new();
+                scroll.set_vexpand(true);
+                scroll.set_hexpand(true);
+                
+                let list_box_results = ListBox::new();
+                list_box_results.set_selection_mode(gtk::SelectionMode::Single);
+                scroll.set_child(Some(&list_box_results));
+                dialog_box.append(&scroll);
+                
+                let button_box = Box::new(Orientation::Horizontal, 8);
+                button_box.set_halign(Align::End);
+                let cancel_button = Button::with_label("Cancel");
+                let add_selected_button = Button::with_label("Add Selected");
+                button_box.append(&cancel_button);
+                button_box.append(&add_selected_button);
+                dialog_box.append(&button_box);
+                
+                selection_dialog.set_child(Some(&dialog_box));
+                
+                let selection_dialog_clone = selection_dialog.clone();
+                cancel_button.connect_clicked(move |_| {
+                    selection_dialog_clone.close();
+                });
+                
+                // Show loading message
+                let loading_row = gtk::ListBoxRow::new();
+                let loading_label = Label::new(Some("Searching TMDB..."));
+                loading_row.set_child(Some(&loading_label));
+                list_box_results.append(&loading_row);
+                
+                selection_dialog.present();
+                
+                // Fetch TMDB search results in background
+                let list_box_results_clone = list_box_results.clone();
                 let db_clone3 = db_clone2.clone();
                 let list_box_clone3 = list_box_clone2.clone();
                 let status_bar_clone3 = status_bar_clone2.clone();
+                let selection_dialog_clone2 = selection_dialog.clone();
+                let search_title_for_ui = search_title.clone();
+                let file_path_for_movie = file_path_to_use.clone();
                 
-                // Get API key before spawning thread
                 let api_key = db_clone3.borrow().tmdb_api_key.clone();
                 
-                let (sender, receiver) = async_channel::unbounded::<Option<(String, Movie)>>();
+                let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
                 
-                // Update status immediately
-                status_bar_clone3.set_text(&format!("Searching for: {}", title));
-                
-                let title_clone = title.clone();
                 std::thread::spawn(move || {
-                    let client = reqwest::blocking::Client::new();
+                    // Search TMDB
                     let search_url = format!(
                         "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
                         api_key,
-                        urlencoding::encode(&title_clone)
+                        urlencoding::encode(&search_title)
                     );
                     
-                    if let Ok(response) = client.get(&search_url).send() {
-                        if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
-                            if !search_response.results.is_empty() {
-                                let movie_id = search_response.results[0].id;
-                                let details_url = format!(
-                                    "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
-                                    movie_id, api_key
-                                );
-                                
-                                if let Ok(details_response) = client.get(&details_url).send() {
-                                    if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
-                                        let year: u16 = details.release_date
-                                            .split('-')
-                                            .next()
-                                            .and_then(|y| y.parse().ok())
-                                            .unwrap_or(0);
-                                        
-                                        let director = details.credits.crew
-                                            .iter()
-                                            .find(|c| c.job == "Director")
-                                            .map(|c| c.name.clone())
-                                            .unwrap_or_else(|| "Unknown".to_string());
-                                        
-                                        let cast: Vec<String> = details.credits.cast
-                                            .iter()
-                                            .take(5)
-                                            .map(|c| c.name.clone())
-                                            .collect();
-                                        
-                                        let cast_details: Vec<CastMember> = details.credits.cast
-                                            .iter()
-                                            .take(5)
-                                            .map(|c| CastMember {
-                                                name: c.name.clone(),
-                                                character: c.character.clone(),
-                                                profile_path: c.profile_path.as_ref()
-                                                    .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
-                                                    .unwrap_or_default(),
-                                            })
-                                            .collect();
-                                        
-                                        let genres: Vec<String> = details.genres
-                                            .iter()
-                                            .map(|g| g.name.clone())
-                                            .collect();
-                                        
-                                        let poster_url = details.poster_path
-                                            .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
-                                            .unwrap_or_default();
-                                        
-                                        let poster_path = if !poster_url.is_empty() {
-                                            download_poster(&poster_url, movie_id).unwrap_or_default()
-                                        } else {
-                                            String::new()
-                                        };
-                                        
-                                        // Fetch IMDb ID
-                                        let external_ids_url = format!(
-                                            "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
-                                            movie_id, api_key
-                                        );
-                                        
-                                        let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
-                                            if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
-                                                external_ids.imdb_id.unwrap_or_default()
-                                            } else {
-                                                String::new()
-                                            }
-                                        } else {
-                                            String::new()
-                                        };
-                                        
-                                        let movie = Movie {
-                                            id: 0,
-                                            title: details.title.clone(),
-                                            year,
-                                            director,
-                                            genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
-                                            rating: details.vote_average,
-                                            runtime: details.runtime.unwrap_or(0),
-                                            description: details.overview,
-                                            cast,
-                                            cast_details,
-                                            file_path: String::new(),
-                                            poster_url,
-                                            tmdb_id: movie_id,
-                                            imdb_id,
-                                            poster_path,
-                                        };
-                                        
-                                        let _ = sender.send_blocking(Some((details.title, movie)));
-                                        return;
+                    if let Ok(response) = reqwest::blocking::get(&search_url) {
+                        if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
+                            let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
+                                // Show ALL results (up to 20)
+                                .map(|r| {
+                                    let details_url = format!(
+                                        "https://api.themoviedb.org/3/movie/{}?api_key={}",
+                                        r.id, api_key
+                                    );
+                                    
+                                    if let Ok(details_response) = reqwest::blocking::get(&details_url) {
+                                        if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
+                                            let year = details.release_date
+                                                .split('-')
+                                                .next()
+                                                .and_then(|y| y.parse().ok())
+                                                .unwrap_or(0);
+                                            return (r.id, details.title, year.to_string(), details.vote_average);
+                                        }
                                     }
-                                }
-                            }
+                                    (r.id, "Unknown".to_string(), "????".to_string(), 0.0)
+                                })
+                                .collect();
+                            
+                            let _ = sender.send_blocking(results);
                         }
                     }
-                    
-                    let _ = sender.send_blocking(None);
                 });
                 
+                // Update UI with results
                 glib::spawn_future_local(async move {
-                    if let Ok(result) = receiver.recv().await {
-                        if let Some((title, movie)) = result {
-                            db_clone3.borrow_mut().add_movie(movie);
-                            
-                            while let Some(child) = list_box_clone3.first_child() {
-                                list_box_clone3.remove(&child);
-                            }
-                            let movies = db_clone3.borrow().list_all();
-                            for movie in &movies {
-                                let row = create_movie_row(movie);
-                                list_box_clone3.append(&row);
-                            }
-                            status_bar_clone3.set_text(&format!("✓ Added: {}", title));
-                        } else {
-                            status_bar_clone3.set_text(&format!("❌ Movie not found: {}", title));
+                    if let Ok(results) = receiver.recv().await {
+                        // Remove loading message
+                        while let Some(child) = list_box_results_clone.first_child() {
+                            list_box_results_clone.remove(&child);
                         }
+                        
+                        if results.is_empty() {
+                            let no_results_row = gtk::ListBoxRow::new();
+                            let no_results_label = Label::new(Some("No results found"));
+                            no_results_row.set_child(Some(&no_results_label));
+                            list_box_results_clone.append(&no_results_row);
+                            return;
+                        }
+                        
+                        // Update instruction with result count
+                        instruction_clone.set_text(&format!(
+                            "Select the movie to add for \"{}\" ({} results found):",
+                            search_title_for_ui, results.len()
+                        ));
+                        
+                        // Add result rows
+                        for (tmdb_id, title, year, rating) in &results {
+                            let row = gtk::ListBoxRow::new();
+                            row.set_widget_name(&tmdb_id.to_string());
+                            
+                            let row_box = Box::new(Orientation::Vertical, 4);
+                            row_box.set_margin_start(12);
+                            row_box.set_margin_end(12);
+                            row_box.set_margin_top(8);
+                            row_box.set_margin_bottom(8);
+                            
+                            let title_label = Label::new(Some(&format!("{} ({})", title, year)));
+                            title_label.set_xalign(0.0);
+                            title_label.set_markup(&format!("<b>{}</b> ({})", title, year));
+                            
+                            let rating_label = Label::new(Some(&format!("Rating: ⭐ {:.1}/10", rating)));
+                            rating_label.set_xalign(0.0);
+                            
+                            row_box.append(&title_label);
+                            row_box.append(&rating_label);
+                            row.set_child(Some(&row_box));
+                            list_box_results_clone.append(&row);
+                        }
+                        
+                        // Select first result by default
+                        if let Some(first_row) = list_box_results_clone.row_at_index(0) {
+                            list_box_results_clone.select_row(Some(&first_row));
+                        }
+                        
+                        // Handle add selected
+                        let file_path_final = file_path_for_movie.clone();
+                        add_selected_button.connect_clicked(move |_| {
+                            if let Some(selected_row) = list_box_results_clone.selected_row() {
+                                let tmdb_id_str = selected_row.widget_name();
+                                if let Ok(tmdb_id) = tmdb_id_str.as_str().parse::<u32>() {
+                                    status_bar_clone3.set_text(&format!("Adding movie (TMDB ID: {})...", tmdb_id));
+                                    selection_dialog_clone2.close();
+                                    
+                                    // Fetch full metadata
+                                    let db_clone4 = db_clone3.clone();
+                                    let list_box_clone4 = list_box_clone3.clone();
+                                    let status_bar_clone4 = status_bar_clone3.clone();
+                                    
+                                    let api_key = db_clone4.borrow().tmdb_api_key.clone();
+                                    let (sender2, receiver2) = async_channel::unbounded::<Option<(String, Movie)>>();
+                                    
+                                    let file_path_clone = file_path_final.clone();
+                                    std::thread::spawn(move || {
+                                        let details_url = format!(
+                                            "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
+                                            tmdb_id, api_key
+                                        );
+                                        
+                                        if let Ok(response) = reqwest::blocking::get(&details_url) {
+                                            if let Ok(details) = response.json::<TMDBMovieDetails>() {
+                                                let year: u16 = details.release_date
+                                                    .split('-')
+                                                    .next()
+                                                    .and_then(|y| y.parse().ok())
+                                                    .unwrap_or(0);
+                                                
+                                                let director = details.credits.crew
+                                                    .iter()
+                                                    .find(|c| c.job == "Director")
+                                                    .map(|c| c.name.clone())
+                                                    .unwrap_or_else(|| "Unknown".to_string());
+                                                
+                                                let cast: Vec<String> = details.credits.cast
+                                                    .iter()
+                                                    .take(5)
+                                                    .map(|c| c.name.clone())
+                                                    .collect();
+                                                
+                                                let cast_details: Vec<CastMember> = details.credits.cast
+                                                    .iter()
+                                                    .take(5)
+                                                    .map(|c| CastMember {
+                                                        name: c.name.clone(),
+                                                        character: c.character.clone(),
+                                                        profile_path: c.profile_path.as_ref()
+                                                            .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                                                            .unwrap_or_default(),
+                                                    })
+                                                    .collect();
+                                                
+                                                let genres: Vec<String> = details.genres
+                                                    .iter()
+                                                    .map(|g| g.name.clone())
+                                                    .collect();
+                                                
+                                                let poster_url = details.poster_path
+                                                    .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                                    .unwrap_or_default();
+                                                
+                                                let poster_path = if !poster_url.is_empty() {
+                                                    download_poster(&poster_url, tmdb_id).unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                };
+                                                
+                                                // Fetch IMDb ID
+                                                let external_ids_url = format!(
+                                                    "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+                                                    tmdb_id, api_key
+                                                );
+                                                
+                                                let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
+                                                    if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
+                                                        external_ids.imdb_id.unwrap_or_default()
+                                                    } else {
+                                                        String::new()
+                                                    }
+                                                } else {
+                                                    String::new()
+                                                };
+                                                
+                                                let movie = Movie {
+                                                    id: 0,
+                                                    title: details.title.clone(),
+                                                    year,
+                                                    director,
+                                                    genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
+                                                    rating: details.vote_average,
+                                                    runtime: details.runtime.unwrap_or(0),
+                                                    description: details.overview,
+                                                    cast,
+                                                    cast_details,
+                                                    file_path: file_path_clone,
+                                                    poster_url,
+                                                    tmdb_id,
+                                                    imdb_id,
+                                                    poster_path,
+                                                };
+                                                
+                                                let _ = sender2.send_blocking(Some((details.title, movie)));
+                                                return;
+                                            }
+                                        }
+                                        let _ = sender2.send_blocking(None);
+                                    });
+                                    
+                                    glib::spawn_future_local(async move {
+                                        if let Ok(Some((title, movie))) = receiver2.recv().await {
+                                            db_clone4.borrow_mut().add_movie(movie.clone());
+                                            
+                                            let row = create_movie_row(&movie);
+                                            list_box_clone4.append(&row);
+                                            
+                                            status_bar_clone4.set_text(&format!("Added: {}", title));
+                                        } else {
+                                            status_bar_clone4.set_text("Failed to fetch movie metadata");
+                                        }
+                                    });
+                                }
+                            }
+                        });
                     }
                 });
             }
@@ -2127,7 +2423,6 @@ fn build_ui(app: &Application) {
 
         dialog.present();
     });
-
     // Settings button - change API key and manage scan directories
     let window_clone = window.clone();
     let db_clone = db.clone();
