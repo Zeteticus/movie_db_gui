@@ -111,6 +111,8 @@ struct Movie {
     poster_url: String,
     tmdb_id: u32,
     #[serde(default)]
+    imdb_id: String,  // IMDb ID (e.g., "tt0111161")
+    #[serde(default)]
     poster_path: String,  // Local cached poster path
 }
 
@@ -168,6 +170,12 @@ struct TMDBCast {
 struct TMDBCrew {
     name: String,
     job: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TMDBExternalIds {
+    #[serde(default)]
+    imdb_id: Option<String>,
 }
 
 struct MovieDatabase {
@@ -285,6 +293,22 @@ async fn fetch_movie_metadata_async(
         String::new()
     };
     
+    // Fetch IMDb ID from external_ids endpoint
+    let external_ids_url = format!(
+        "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+        movie_id, api_key
+    );
+    
+    let imdb_id = if let Ok(response) = client.get(&external_ids_url).send().await {
+        if let Ok(external_ids) = response.json::<TMDBExternalIds>().await {
+            external_ids.imdb_id.unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    
     Some(Movie {
         id: 0,
         title: details.title,
@@ -299,6 +323,7 @@ async fn fetch_movie_metadata_async(
         file_path,
         poster_url,
         tmdb_id: movie_id,
+        imdb_id,
         poster_path,
     })
 }
@@ -816,6 +841,7 @@ fn build_ui(app: &Application) {
                                                     file_path,
                                                     poster_url: String::new(),
                                                     tmdb_id: 0,
+                                                    imdb_id: String::new(),
                                                     poster_path: String::new(),
                                                 };
                                                 let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
@@ -1024,6 +1050,13 @@ fn build_ui(app: &Application) {
                         String::from("Unknown")
                     };
                     
+                    // Format IMDb ID display (with clickable link if available)
+                    let imdb_display = if !movie.imdb_id.is_empty() {
+                        format!("{} (https://www.imdb.com/title/{})", movie.imdb_id, movie.imdb_id)
+                    } else {
+                        String::from("Not available")
+                    };
+                    
                     let details = format!(
                         "<b>{}</b> ({})\n\n\
                         <b>Director:</b> {}\n\
@@ -1033,11 +1066,12 @@ fn build_ui(app: &Application) {
                         <b>Starring:</b>\n    • {}\n\n\
                         <b>Description:</b>\n{}\n\n\
                         <b>File:</b> {}\n\
-                        <b>TMDB ID:</b> {}",
+                        <b>TMDB ID:</b> {}\n\
+                        <b>IMDb ID:</b> {}",
                         escaped_title, movie.year, escaped_director,
                         escaped_genre, movie.rating, movie.runtime,
                         cast_display, escaped_description, escaped_file,
-                        movie.tmdb_id
+                        movie.tmdb_id, imdb_display
                     );
                     details_label_clone.set_markup(&details);
                 }
@@ -1368,6 +1402,7 @@ fn build_ui(app: &Application) {
                                                         file_path,
                                                         poster_url: String::new(),
                                                         tmdb_id: 0,
+                                                        imdb_id: String::new(),
                                                         poster_path: String::new(),
                                                     };
                                                     let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
@@ -1515,6 +1550,22 @@ fn build_ui(app: &Application) {
                                         String::new()
                                     };
                                     
+                                    // Fetch IMDb ID
+                                    let external_ids_url = format!(
+                                        "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+                                        tmdb_movie_id, api_key
+                                    );
+                                    
+                                    let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
+                                        if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
+                                            external_ids.imdb_id.unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    
                                     let movie = Movie {
                                         id: 0,
                                         title: details.title,
@@ -1529,6 +1580,7 @@ fn build_ui(app: &Application) {
                                         file_path: file_path.clone(),
                                         poster_url,
                                         tmdb_id: tmdb_movie_id,
+                                        imdb_id,
                                         poster_path,
                                     };
                                     
@@ -1802,6 +1854,22 @@ fn build_ui(app: &Application) {
                                                 String::new()
                                             };
                                             
+                                            // Fetch IMDb ID
+                                            let external_ids_url = format!(
+                                                "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+                                                tmdb_id, api_key
+                                            );
+                                            
+                                            let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
+                                                if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
+                                                    external_ids.imdb_id.unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            } else {
+                                                String::new()
+                                            };
+                                            
                                             let new_movie = Movie {
                                                 id: 0,
                                                 title: details.title,
@@ -1816,6 +1884,7 @@ fn build_ui(app: &Application) {
                                                 file_path: file_path_clone,
                                                 poster_url,
                                                 tmdb_id,
+                                                imdb_id,
                                                 poster_path,
                                             };
                                             
@@ -1989,6 +2058,22 @@ fn build_ui(app: &Application) {
                                             String::new()
                                         };
                                         
+                                        // Fetch IMDb ID
+                                        let external_ids_url = format!(
+                                            "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+                                            movie_id, api_key
+                                        );
+                                        
+                                        let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
+                                            if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
+                                                external_ids.imdb_id.unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        
                                         let movie = Movie {
                                             id: 0,
                                             title: details.title.clone(),
@@ -2003,6 +2088,7 @@ fn build_ui(app: &Application) {
                                             file_path: String::new(),
                                             poster_url,
                                             tmdb_id: movie_id,
+                                            imdb_id,
                                             poster_path,
                                         };
                                         
