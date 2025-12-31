@@ -1,7 +1,0 @@
-/home/ascensus/movie_db_gui/target/release/deps/equivalent-cae8259c6c10db17.d: /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2/src/lib.rs
-
-/home/ascensus/movie_db_gui/target/release/deps/libequivalent-cae8259c6c10db17.rlib: /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2/src/lib.rs
-
-/home/ascensus/movie_db_gui/target/release/deps/libequivalent-cae8259c6c10db17.rmeta: /home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2/src/lib.rs
-
-/home/ascensus/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/equivalent-1.0.2/src/lib.rs:
