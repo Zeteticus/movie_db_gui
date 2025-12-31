@@ -953,12 +953,12 @@ fn build_ui(app: &Application) {
         }
     }
 
-    // Search functionality
+    // Search functionality - only trigger on Enter key
     let list_box_clone = list_box.clone();
     let db_clone = db.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
-    search_entry.connect_search_changed(move |entry| {
+    search_entry.connect_activate(move |entry| {
         let query = entry.text();
         let selected_idx = genre_dropdown_clone.selected();
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
