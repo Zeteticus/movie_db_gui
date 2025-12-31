@@ -594,6 +594,7 @@ fn build_ui(app: &Application) {
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
+    let select_version_button = Button::with_label("🎞️ Wrong Movie?");
     let settings_button = Button::with_label("⚙️ Settings");
     
     header.append(&title_label);
@@ -601,6 +602,7 @@ fn build_ui(app: &Application) {
     header.set_hexpand(true);
     title_label.set_hexpand(true);
     header.append(&settings_button);
+    header.append(&select_version_button);
     header.append(&refresh_button);
     header.append(&scan_button);
     header.append(&add_button);
@@ -626,7 +628,7 @@ fn build_ui(app: &Application) {
     search_entry.set_placeholder_text(Some("Search movies..."));
     search_entry.set_hexpand(true);
 
-    let genres = StringList::new(&["All", "Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Thriller", "Romance"]);
+    let genres = StringList::new(&["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"]);
     let genre_dropdown = DropDown::new(Some(genres), None::<gtk::Expression>);
     genre_dropdown.set_selected(0);
 
@@ -729,6 +731,14 @@ fn build_ui(app: &Application) {
                 
                 let api_key_clone = api_key.clone();
                 let scan_dirs_clone = scan_dirs.clone();
+                
+                // Extract existing file paths before spawning thread (Rc can't be sent between threads)
+                let existing_paths: std::collections::HashSet<String> = db_clone.borrow()
+                    .movies
+                    .values()
+                    .map(|m| m.file_path.clone())
+                    .collect();
+                
                 std::thread::spawn(move || {
                     // Use tokio runtime for async operations
                     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -748,13 +758,25 @@ fn build_ui(app: &Application) {
                             scan_directory_recursive(path, &video_extensions, &mut files_to_process);
                         }
                         
-                        let _ = sender.send_blocking(("status".to_string(), format!("Found {} video files, fetching metadata in parallel...", files_to_process.len()), None));
+                        // Filter out files that already exist in database (using pre-extracted paths)
+                        
+                        let new_files: Vec<_> = files_to_process.into_iter()
+                            .filter(|(_, file_path)| !existing_paths.contains(file_path))
+                            .collect();
+                        
+                        if new_files.is_empty() {
+                            let _ = sender.send_blocking(("status".to_string(), "No new movies found - all files already in database".to_string(), None));
+                            let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                            return;
+                        }
+                        
+                        let _ = sender.send_blocking(("status".to_string(), format!("Found {} new video files (skipped {} existing), fetching metadata in parallel...", new_files.len(), existing_paths.len()), None));
                         
                         // Process files in parallel batches of 10
                         let client = reqwest::Client::new();
                         let batch_size = 10;
                         
-                        for batch in files_to_process.chunks(batch_size) {
+                        for batch in new_files.chunks(batch_size) {
                             let futures: Vec<_> = batch.iter()
                                 .map(|(clean_title, file_path_str)| {
                                     let api_key = api_key_clone.clone();
@@ -1212,8 +1234,13 @@ fn build_ui(app: &Application) {
                     // Create async channel
                     let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
                     
-                    // Get API key before spawning thread
+                    // Get API key and existing paths before spawning thread (Rc can't be sent)
                     let api_key = db_clone3.borrow().tmdb_api_key.clone();
+                    let existing_paths: std::collections::HashSet<String> = db_clone3.borrow()
+                        .movies
+                        .values()
+                        .map(|m| m.file_path.clone())
+                        .collect();
                     
                     // Spawn background thread with async runtime
                     std::thread::spawn(move || {
@@ -1232,13 +1259,25 @@ fn build_ui(app: &Application) {
                             let path = Path::new(&path_str);
                             scan_directory_recursive(path, &video_extensions, &mut files_to_process);
                             
-                            let _ = sender.send_blocking(("status".to_string(), format!("Found {} video files, fetching metadata in parallel...", files_to_process.len()), None));
+                            // Filter out files that already exist in database (using pre-extracted paths)
+                            
+                            let new_files: Vec<_> = files_to_process.into_iter()
+                                .filter(|(_, file_path)| !existing_paths.contains(file_path))
+                                .collect();
+                            
+                            if new_files.is_empty() {
+                                let _ = sender.send_blocking(("status".to_string(), "No new movies found - all files already in database".to_string(), None));
+                                let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                                return;
+                            }
+                            
+                            let _ = sender.send_blocking(("status".to_string(), format!("Found {} new video files (skipped {} existing), fetching metadata in parallel...", new_files.len(), existing_paths.len()), None));
                             
                             // Process files in parallel batches of 10
                             let client = reqwest::Client::new();
                             let batch_size = 10;
                             
-                            for batch in files_to_process.chunks(batch_size) {
+                            for batch in new_files.chunks(batch_size) {
                                 let futures: Vec<_> = batch.iter()
                                     .map(|(clean_title, file_path_str)| {
                                         let api_key = api_key.clone();
@@ -1462,6 +1501,295 @@ fn build_ui(app: &Application) {
                     } else {
                         status_bar_clone2.set_text("Failed to refresh metadata");
                     }
+                }
+            });
+        }
+    });
+
+    // Select Different Version button - search TMDB and let user choose
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    let list_box_clone = list_box.clone();
+    let status_bar_clone = status_bar.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    select_version_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id == 0 {
+            status_bar_clone.set_text("Please select a movie first");
+            return;
+        }
+        
+        let db = db_clone.borrow();
+        if let Some(movie) = db.movies.get(&movie_id) {
+            let movie_title = movie.title.clone();
+            let file_path = movie.file_path.clone();
+            let api_key = db.tmdb_api_key.clone();
+            drop(db); // Release borrow
+            
+            // Create selection dialog
+            let selection_dialog = Window::builder()
+                .title(&format!("Select Version: {}", movie_title))
+                .modal(true)
+                .transient_for(&window_clone)
+                .default_width(600)
+                .default_height(400)
+                .build();
+            
+            let dialog_box = Box::new(Orientation::Vertical, 12);
+            dialog_box.set_margin_start(20);
+            dialog_box.set_margin_end(20);
+            dialog_box.set_margin_top(20);
+            dialog_box.set_margin_bottom(20);
+            
+            let instruction = Label::new(Some(&format!("Select the correct version of \"{}\":", movie_title)));
+            instruction.set_xalign(0.0);
+            dialog_box.append(&instruction);
+            
+            let scroll = ScrolledWindow::new();
+            scroll.set_vexpand(true);
+            scroll.set_hexpand(true);
+            
+            let list_box_results = ListBox::new();
+            list_box_results.set_selection_mode(gtk::SelectionMode::Single);
+            scroll.set_child(Some(&list_box_results));
+            dialog_box.append(&scroll);
+            
+            let button_box = Box::new(Orientation::Horizontal, 8);
+            button_box.set_halign(Align::End);
+            let cancel_button = Button::with_label("Cancel");
+            let select_button = Button::with_label("Use Selected");
+            button_box.append(&cancel_button);
+            button_box.append(&select_button);
+            dialog_box.append(&button_box);
+            
+            selection_dialog.set_child(Some(&dialog_box));
+            
+            let selection_dialog_clone = selection_dialog.clone();
+            cancel_button.connect_clicked(move |_| {
+                selection_dialog_clone.close();
+            });
+            
+            // Show loading message
+            let loading_row = gtk::ListBoxRow::new();
+            let loading_label = Label::new(Some("Searching TMDB..."));
+            loading_row.set_child(Some(&loading_label));
+            list_box_results.append(&loading_row);
+            
+            selection_dialog.present();
+            
+            // Fetch TMDB search results in background
+            let list_box_results_clone = list_box_results.clone();
+            let db_clone2 = db_clone.clone();
+            let list_box_clone2 = list_box_clone.clone();
+            let status_bar_clone2 = status_bar_clone.clone();
+            let selection_dialog_clone2 = selection_dialog.clone();
+            
+            let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
+            
+            std::thread::spawn(move || {
+                // Search TMDB
+                let search_url = format!(
+                    "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                    api_key,
+                    urlencoding::encode(&movie_title)
+                );
+                
+                if let Ok(response) = reqwest::blocking::get(&search_url) {
+                    if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
+                        let results: Vec<(u32, String, String, f32)> = search_result.results.iter()
+                            .take(10) // Show top 10 results
+                            .map(|r| {
+                                // Fetch basic details for each to get year
+                                let details_url = format!(
+                                    "https://api.themoviedb.org/3/movie/{}?api_key={}",
+                                    r.id, api_key
+                                );
+                                
+                                if let Ok(details_response) = reqwest::blocking::get(&details_url) {
+                                    if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
+                                        let year = details.release_date
+                                            .split('-')
+                                            .next()
+                                            .and_then(|y| y.parse().ok())
+                                            .unwrap_or(0);
+                                        return (r.id, details.title, year.to_string(), details.vote_average);
+                                    }
+                                }
+                                (r.id, "Unknown".to_string(), "????".to_string(), 0.0)
+                            })
+                            .collect();
+                        
+                        let _ = sender.send_blocking(results);
+                    }
+                }
+            });
+            
+            // Update UI with results
+            glib::spawn_future_local(async move {
+                if let Ok(results) = receiver.recv().await {
+                    // Remove loading message
+                    while let Some(child) = list_box_results_clone.first_child() {
+                        list_box_results_clone.remove(&child);
+                    }
+                    
+                    if results.is_empty() {
+                        let no_results_row = gtk::ListBoxRow::new();
+                        let no_results_label = Label::new(Some("No results found"));
+                        no_results_row.set_child(Some(&no_results_label));
+                        list_box_results_clone.append(&no_results_row);
+                        return;
+                    }
+                    
+                    // Add result rows
+                    for (tmdb_id, title, year, rating) in &results {
+                        let row = gtk::ListBoxRow::new();
+                        row.set_widget_name(&tmdb_id.to_string());
+                        
+                        let row_box = Box::new(Orientation::Vertical, 4);
+                        row_box.set_margin_start(12);
+                        row_box.set_margin_end(12);
+                        row_box.set_margin_top(8);
+                        row_box.set_margin_bottom(8);
+                        
+                        let title_label = Label::new(Some(&format!("{} ({})", title, year)));
+                        title_label.set_xalign(0.0);
+                        title_label.set_markup(&format!("<b>{}</b> ({})", title, year));
+                        
+                        let rating_label = Label::new(Some(&format!("Rating: ⭐ {:.1}/10", rating)));
+                        rating_label.set_xalign(0.0);
+                        
+                        row_box.append(&title_label);
+                        row_box.append(&rating_label);
+                        row.set_child(Some(&row_box));
+                        list_box_results_clone.append(&row);
+                    }
+                    
+                    // Select first result by default
+                    if let Some(first_row) = list_box_results_clone.row_at_index(0) {
+                        list_box_results_clone.select_row(Some(&first_row));
+                    }
+                    
+                    // Handle selection
+                    select_button.connect_clicked(move |_| {
+                        if let Some(selected_row) = list_box_results_clone.selected_row() {
+                            let tmdb_id_str = selected_row.widget_name();
+                            if let Ok(tmdb_id) = tmdb_id_str.as_str().parse::<u32>() {
+                                status_bar_clone2.set_text(&format!("Fetching metadata for TMDB ID {}...", tmdb_id));
+                                selection_dialog_clone2.close();
+                                
+                                // Fetch full metadata for selected movie
+                                let db_clone3 = db_clone2.clone();
+                                let list_box_clone3 = list_box_clone2.clone();
+                                let status_bar_clone3 = status_bar_clone2.clone();
+                                let file_path_clone = file_path.clone();
+                                
+                                // Extract API key before spawning thread (Rc can't be sent)
+                                let api_key = db_clone3.borrow().tmdb_api_key.clone();
+                                
+                                let (sender2, receiver2) = async_channel::unbounded::<Option<(u32, Movie)>>();
+                                
+                                std::thread::spawn(move || {
+                                    let details_url = format!(
+                                        "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
+                                        tmdb_id, api_key
+                                    );
+                                    
+                                    if let Ok(response) = reqwest::blocking::get(&details_url) {
+                                        if let Ok(details) = response.json::<TMDBMovieDetails>() {
+                                            // Build Movie struct (same as fetch_movie_metadata_async)
+                                            let year: u16 = details.release_date
+                                                .split('-')
+                                                .next()
+                                                .and_then(|y| y.parse().ok())
+                                                .unwrap_or(0);
+                                            
+                                            let director = details.credits.crew
+                                                .iter()
+                                                .find(|c| c.job == "Director")
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| "Unknown".to_string());
+                                            
+                                            let cast: Vec<String> = details.credits.cast
+                                                .iter()
+                                                .take(5)
+                                                .map(|c| c.name.clone())
+                                                .collect();
+                                            
+                                            let cast_details: Vec<CastMember> = details.credits.cast
+                                                .iter()
+                                                .take(5)
+                                                .map(|c| CastMember {
+                                                    name: c.name.clone(),
+                                                    character: c.character.clone(),
+                                                    profile_path: c.profile_path.as_ref()
+                                                        .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                                                        .unwrap_or_default(),
+                                                })
+                                                .collect();
+                                            
+                                            let genres: Vec<String> = details.genres
+                                                .iter()
+                                                .map(|g| g.name.clone())
+                                                .collect();
+                                            
+                                            let poster_url = details.poster_path
+                                                .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                                .unwrap_or_default();
+                                            
+                                            let poster_path = if !poster_url.is_empty() {
+                                                download_poster(&poster_url, tmdb_id).unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
+                                            
+                                            let new_movie = Movie {
+                                                id: 0,
+                                                title: details.title,
+                                                year,
+                                                director,
+                                                genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
+                                                rating: details.vote_average,
+                                                runtime: details.runtime.unwrap_or(0),
+                                                description: details.overview,
+                                                cast,
+                                                cast_details,
+                                                file_path: file_path_clone,
+                                                poster_url,
+                                                tmdb_id,
+                                                poster_path,
+                                            };
+                                            
+                                            let _ = sender2.send_blocking(Some((movie_id, new_movie)));
+                                            return;
+                                        }
+                                    }
+                                    let _ = sender2.send_blocking(None);
+                                });
+                                
+                                glib::spawn_future_local(async move {
+                                    if let Ok(Some((old_id, new_movie))) = receiver2.recv().await {
+                                        db_clone3.borrow_mut().delete_movie(old_id);
+                                        db_clone3.borrow_mut().add_movie(new_movie);
+                                        
+                                        // Refresh list
+                                        while let Some(child) = list_box_clone3.first_child() {
+                                            list_box_clone3.remove(&child);
+                                        }
+                                        
+                                        let movies = db_clone3.borrow().list_all();
+                                        for movie in &movies {
+                                            let row = create_movie_row(movie);
+                                            list_box_clone3.append(&row);
+                                        }
+                                        
+                                        status_bar_clone3.set_text("Movie version updated successfully!");
+                                    } else {
+                                        status_bar_clone3.set_text("Failed to fetch metadata");
+                                    }
+                                });
+                            }
+                        }
+                    });
                 }
             });
         }
