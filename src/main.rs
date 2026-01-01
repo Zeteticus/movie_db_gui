@@ -502,19 +502,24 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
         let mut cache = poster_cache.borrow_mut();
         
         if let Some(pixbuf) = cache.get(&movie.id) {
-            // Use cached pixbuf (FAST!)
-            let picture = Picture::for_pixbuf(pixbuf);
-            picture.set_can_shrink(true);
-            poster_box.append(&picture);
-        } else {
-            // Load from disk and cache it
-            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 60, 90, true) {
-                // Cache for next time
-                cache.insert(movie.id, pixbuf.clone());
-                
-                let picture = Picture::for_pixbuf(&pixbuf);
+            // Use cached pixbuf and scale for display (FAST!)
+            if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                let picture = Picture::for_pixbuf(&scaled);
                 picture.set_can_shrink(true);
                 poster_box.append(&picture);
+            }
+        } else {
+            // Load FULL RESOLUTION from disk and cache it
+            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
+                // Cache the FULL resolution
+                cache.insert(movie.id, pixbuf.clone());
+                
+                // Scale for display
+                if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    let picture = Picture::for_pixbuf(&scaled);
+                    picture.set_can_shrink(true);
+                    poster_box.append(&picture);
+                }
             }
         }
     } else {
@@ -568,18 +573,23 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
         let mut cache = poster_cache.borrow_mut();
         
         if let Some(pixbuf) = cache.get(&movie.id) {
-            // Scale for grid view (larger)
+            // Scale cached full-res for grid view (larger)
             if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
                 let picture = Picture::for_pixbuf(&scaled);
                 picture.set_can_shrink(true);
                 poster_box.append(&picture);
             }
         } else {
-            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
+            // Load FULL RESOLUTION and cache it
+            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
                 cache.insert(movie.id, pixbuf.clone());
-                let picture = Picture::for_pixbuf(&pixbuf);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
+                
+                // Scale for display
+                if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    let picture = Picture::for_pixbuf(&scaled);
+                    picture.set_can_shrink(true);
+                    poster_box.append(&picture);
+                }
             }
         }
     } else {
@@ -1291,10 +1301,12 @@ fn build_ui(app: &Application) {
                 // Get the actual movie from the database by ID
                 let db = db_clone.borrow();
                 if let Some(movie) = db.movies.get(&movie_id) {
-                    // Update poster
+                    // Update poster - load full resolution then scale for display
                     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-                        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
-                            poster_display_clone.set_pixbuf(Some(&pixbuf));
+                        if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
+                            if let Some(scaled) = pixbuf.scale_simple(200, 300, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                                poster_display_clone.set_pixbuf(Some(&scaled));
+                            }
                         }
                     } else {
                         poster_display_clone.set_pixbuf(None);
@@ -1361,10 +1373,12 @@ fn build_ui(app: &Application) {
             // Get the actual movie from the database by ID
             let db = db_clone.borrow();
             if let Some(movie) = db.movies.get(&movie_id) {
-                // Update poster
+                // Update poster - load full resolution then scale for display
                 if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-                    if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
-                        poster_display_clone.set_pixbuf(Some(&pixbuf));
+                    if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
+                        if let Some(scaled) = pixbuf.scale_simple(200, 300, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                            poster_display_clone.set_pixbuf(Some(&scaled));
+                        }
                     }
                 } else {
                     poster_display_clone.set_pixbuf(None);
