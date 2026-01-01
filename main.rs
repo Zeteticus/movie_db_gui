@@ -2537,11 +2537,11 @@ fn build_ui(app: &Application) {
             
             // Create selection dialog
             let selection_dialog = Window::builder()
-                .title(&format!("Select Version: {}", movie_title))
+                .title(&format!("Select Version: {} ({})", movie_title, if movie_year > 0 { movie_year.to_string() } else { "Unknown year".to_string() }))
                 .modal(true)
                 .transient_for(&window_clone)
-                .default_width(700)
-                .default_height(600)
+                .default_width(600)
+                .default_height(400)
                 .build();
             
             let dialog_box = Box::new(Orientation::Vertical, 12);
@@ -2551,9 +2551,9 @@ fn build_ui(app: &Application) {
             dialog_box.set_margin_bottom(20);
             
             let instruction_text = if movie_year > 0 {
-                format!("Select the correct version of \"{}\" (showing all years, {} matches highlighted first):", movie_title, movie_year)
+                format!("Select the correct version of \"{}\" ({}):", movie_title, movie_year)
             } else {
-                format!("Select the correct version of \"{}\" (showing all years):", movie_title)
+                format!("Select the correct version of \"{}\":", movie_title)
             };
             let instruction = Label::new(Some(&instruction_text));
             instruction.set_xalign(0.0);
@@ -2602,8 +2602,12 @@ fn build_ui(app: &Application) {
             
             let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
             
-            // Check cache first - use title only for cache key to get more results
-            let cache_key = movie_title.clone();
+            // Check cache first - include year in cache key for more specific caching
+            let cache_key = if movie_year > 0 {
+                format!("{} ({})", movie_title, movie_year)
+            } else {
+                movie_title.clone()
+            };
             let cached_results = db_clone2.borrow().get_cached_search(&cache_key);
             
             if let Some(results) = cached_results {
@@ -2615,14 +2619,24 @@ fn build_ui(app: &Application) {
                     let mut all_results = Vec::new();
                     
                     // Fetch up to 5 pages (100 results total) for comprehensive results
-                    // DON'T filter by year - we want ALL matches so user can find the right one
                     for page in 1..=5 {
-                        let search_url = format!(
-                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}&page={}",
-                            api_key,
-                            urlencoding::encode(&movie_title),
-                            page
-                        );
+                        // Search TMDB with year parameter if available
+                        let search_url = if movie_year > 0 {
+                            format!(
+                                "https://api.themoviedb.org/3/search/movie?api_key={}&query={}&year={}&page={}",
+                                api_key,
+                                urlencoding::encode(&movie_title),
+                                movie_year,
+                                page
+                            )
+                        } else {
+                            format!(
+                                "https://api.themoviedb.org/3/search/movie?api_key={}&query={}&page={}",
+                                api_key,
+                                urlencoding::encode(&movie_title),
+                                page
+                            )
+                        };
                         
                         if let Ok(response) = reqwest::blocking::get(&search_url) {
                             if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
@@ -2667,28 +2681,8 @@ fn build_ui(app: &Application) {
                         }
                     }
                     
-                    // Sort results: exact year matches first, then by popularity (rating)
+                    // Send all collected results
                     if !all_results.is_empty() {
-                        all_results.sort_by(|a, b| {
-                            let a_year: u16 = a.2.parse().unwrap_or(0);
-                            let b_year: u16 = b.2.parse().unwrap_or(0);
-                            
-                            // If we have a year to match, prioritize exact matches
-                            if movie_year > 0 {
-                                let a_matches = a_year == movie_year;
-                                let b_matches = b_year == movie_year;
-                                
-                                if a_matches && !b_matches {
-                                    return std::cmp::Ordering::Less;
-                                } else if !a_matches && b_matches {
-                                    return std::cmp::Ordering::Greater;
-                                }
-                            }
-                            
-                            // Then sort by rating (higher is better)
-                            b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        
                         let _ = sender.send_blocking(all_results);
                     }
                 });
