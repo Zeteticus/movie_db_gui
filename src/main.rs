@@ -309,7 +309,7 @@ async fn fetch_movie_metadata_async(
         .collect();
     
     let poster_url = details.poster_path
-        .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+        .map(|p| format!("https://image.tmdb.org/t/p/original{}", p))
         .unwrap_or_default();
     
     let poster_path = if !poster_url.is_empty() {
@@ -553,6 +553,63 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     row
 }
 
+fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::FlowBoxChild {
+    let child = gtk::FlowBoxChild::new();
+    child.set_widget_name(&movie.id.to_string());
+    
+    let vbox = Box::new(Orientation::Vertical, 8);
+    vbox.set_size_request(180, 320);
+    
+    // Poster
+    let poster_box = Box::new(Orientation::Vertical, 0);
+    poster_box.set_size_request(160, 240);
+    
+    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+        let mut cache = poster_cache.borrow_mut();
+        
+        if let Some(pixbuf) = cache.get(&movie.id) {
+            // Scale for grid view (larger)
+            if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                let picture = Picture::for_pixbuf(&scaled);
+                picture.set_can_shrink(true);
+                poster_box.append(&picture);
+            }
+        } else {
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
+                cache.insert(movie.id, pixbuf.clone());
+                let picture = Picture::for_pixbuf(&pixbuf);
+                picture.set_can_shrink(true);
+                poster_box.append(&picture);
+            }
+        }
+    } else {
+        let placeholder = Label::new(Some("🎬"));
+        placeholder.set_markup("<span size='70000'>🎬</span>");
+        poster_box.append(&placeholder);
+    }
+    
+    vbox.append(&poster_box);
+    
+    // Title and year
+    let title_label = Label::new(Some(&format!("{} ({})", movie.title, movie.year)));
+    title_label.set_wrap(true);
+    title_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    title_label.set_max_width_chars(20);
+    title_label.set_justify(gtk::Justification::Center);
+    let escaped_title = escape_markup(&movie.title);
+    title_label.set_markup(&format!("<b>{}</b>\n<small>({})</small>", escaped_title, movie.year));
+    
+    // Rating
+    let rating_label = Label::new(Some(&format!("⭐ {:.1}/10", movie.rating)));
+    rating_label.set_opacity(0.8);
+    
+    vbox.append(&title_label);
+    vbox.append(&rating_label);
+    
+    child.set_child(Some(&vbox));
+    child
+}
+
 fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
     // Try to load existing config first
     if let Some(config) = load_config() {
@@ -705,6 +762,8 @@ fn build_ui(app: &Application) {
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
+    let refresh_all_button = Button::with_label("🔄 Refresh All");
+    refresh_all_button.set_tooltip_text(Some("Refresh metadata and posters for ALL movies"));
     let edit_button = Button::with_label("✏️ Edit Metadata");
     let select_version_button = Button::with_label("🎞️ Wrong Movie?");
     let stats_button = Button::with_label("📊 Statistics");
@@ -716,6 +775,7 @@ fn build_ui(app: &Application) {
     title_label.set_hexpand(true);
     header.append(&stats_button);
     header.append(&settings_button);
+    header.append(&refresh_all_button);
     header.append(&edit_button);
     header.append(&select_version_button);
     header.append(&refresh_button);
@@ -756,14 +816,37 @@ fn build_ui(app: &Application) {
     search_box.append(&genre_dropdown);
     search_box.append(&Label::new(Some("Sort:")));
     search_box.append(&sort_dropdown);
+    search_box.append(&Label::new(Some("View:")));
+    
+    // View toggle button
+    let view_toggle = Button::with_label("📋 List");
+    view_toggle.set_tooltip_text(Some("Switch between list and grid view"));
+    search_box.append(&view_toggle);
+    
     main_box.append(&search_box);
 
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
     scrolled.set_hexpand(true);
     
+    // List view (default)
     let list_box = ListBox::new();
     list_box.set_selection_mode(gtk::SelectionMode::Single);
+    
+    // Grid view (alternative)
+    let grid_flow = gtk::FlowBox::new();
+    grid_flow.set_selection_mode(gtk::SelectionMode::Single);
+    grid_flow.set_column_spacing(12);
+    grid_flow.set_row_spacing(12);
+    grid_flow.set_margin_start(12);
+    grid_flow.set_margin_end(12);
+    grid_flow.set_margin_top(12);
+    grid_flow.set_margin_bottom(12);
+    grid_flow.set_homogeneous(true);
+    grid_flow.set_min_children_per_line(2);
+    grid_flow.set_max_children_per_line(8);
+    
+    // Start with list view
     scrolled.set_child(Some(&list_box));
     main_box.append(&scrolled);
 
@@ -844,6 +927,39 @@ fn build_ui(app: &Application) {
 
     window.set_child(Some(&main_box));
 
+    // View toggle state and handler
+    let is_grid_view = Rc::new(RefCell::new(false));
+    let is_grid_view_clone = is_grid_view.clone();
+    let scrolled_clone = scrolled.clone();
+    let list_box_clone_toggle = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
+    let db_clone_toggle = db.clone();
+    let poster_cache_clone_toggle = poster_cache.clone();
+    
+    view_toggle.connect_clicked(move |button| {
+        let mut is_grid = is_grid_view_clone.borrow_mut();
+        *is_grid = !*is_grid;
+        
+        if *is_grid {
+            // Switch to grid view
+            button.set_label("🎞️ Grid");
+            scrolled_clone.set_child(Some(&grid_flow_clone));
+            
+            // Populate grid with current movies
+            while let Some(child) = grid_flow_clone.first_child() {
+                grid_flow_clone.remove(&child);
+            }
+            let movies = db_clone_toggle.borrow().list_all();
+            for movie in &movies {
+                let item = create_movie_grid_item(&movie, &poster_cache_clone_toggle);
+                grid_flow_clone.append(&item);
+            }
+        } else {
+            // Switch to list view
+            button.set_label("📋 List");
+            scrolled_clone.set_child(Some(&list_box_clone_toggle));
+        }
+    });
 
     // Populate initial list
     let db_clone = db.clone();
@@ -1030,15 +1146,20 @@ fn build_ui(app: &Application) {
     // Helper function to refresh list with current filters and sorting
     fn refresh_movie_list(
         list_box: &ListBox,
+        grid_flow: &gtk::FlowBox,
+        is_grid_view: bool,
         db: &Rc<RefCell<MovieDatabase>>,
         search_query: &str,
         genre_filter: &str,
         sort_by: &str,
         poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
     ) {
-        // Clear existing rows
+        // Clear existing items from both views
         while let Some(child) = list_box.first_child() {
             list_box.remove(&child);
+        }
+        while let Some(child) = grid_flow.first_child() {
+            grid_flow.remove(&child);
         }
 
         let mut results = if search_query.is_empty() {
@@ -1073,19 +1194,28 @@ fn build_ui(app: &Application) {
             _ => {}
         }
 
-        // Add rows with poster cache
-        for movie in &results {
-            let row = create_movie_row(movie, poster_cache);
-            list_box.append(&row);
+        // Populate the active view
+        if is_grid_view {
+            for movie in &results {
+                let item = create_movie_grid_item(movie, poster_cache);
+                grid_flow.append(&item);
+            }
+        } else {
+            for movie in &results {
+                let row = create_movie_row(movie, poster_cache);
+                list_box.append(&row);
+            }
         }
     }
 
     // Search functionality - only trigger on Enter key
     let list_box_clone = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
     let db_clone = db.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
+    let is_grid_view_clone = is_grid_view.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text();
         let selected_idx = genre_dropdown_clone.selected();
@@ -1096,15 +1226,18 @@ fn build_ui(app: &Application) {
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_clone);
+        let is_grid = *is_grid_view_clone.borrow();
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Genre filter
     let list_box_clone = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
+    let is_grid_view_clone = is_grid_view.clone();
     genre_dropdown.connect_selected_notify(move |dropdown| {
         let selected_idx = dropdown.selected();
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
@@ -1115,15 +1248,18 @@ fn build_ui(app: &Application) {
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        let is_grid = *is_grid_view_clone.borrow();
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
     });
     
     // Sort dropdown
     let list_box_clone = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
+    let is_grid_view_clone = is_grid_view.clone();
     sort_dropdown.connect_selected_notify(move |dropdown| {
         let sort_idx = dropdown.selected();
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
@@ -1134,7 +1270,8 @@ fn build_ui(app: &Application) {
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
-        refresh_movie_list(&list_box_clone, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        let is_grid = *is_grid_view_clone.borrow();
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Movie selection
@@ -1205,6 +1342,75 @@ fn build_ui(app: &Application) {
                     );
                     details_label_clone.set_markup(&details);
                 }
+            }
+        }
+    });
+
+    // Grid view selection (same logic as list)
+    let details_label_clone = details_label.clone();
+    let poster_display_clone = poster_display.clone();
+    let db_clone = db.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    
+    grid_flow.connect_child_activated(move |_, child| {
+        // Get the movie ID from the child's widget name
+        let movie_id_str = child.widget_name();
+        if let Ok(movie_id) = movie_id_str.as_str().parse::<u32>() {
+            *selected_movie_id_clone.borrow_mut() = movie_id;
+            
+            // Get the actual movie from the database by ID
+            let db = db_clone.borrow();
+            if let Some(movie) = db.movies.get(&movie_id) {
+                // Update poster
+                if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+                    if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
+                        poster_display_clone.set_pixbuf(Some(&pixbuf));
+                    }
+                } else {
+                    poster_display_clone.set_pixbuf(None);
+                }
+                
+                // Escape all text that goes into markup
+                let escaped_title = escape_markup(&movie.title);
+                let escaped_director = escape_markup(&movie.director);
+                let escaped_genre = escape_markup(&movie.genre.join(", "));
+                let escaped_description = escape_markup(&movie.description);
+                let escaped_file = escape_markup(&movie.file_path);
+                
+                // Format cast members with better visual presentation
+                let cast_display = if !movie.cast.is_empty() {
+                    let cast_list: Vec<String> = movie.cast.iter()
+                        .map(|name| escape_markup(name))
+                        .collect();
+                    cast_list.join("\n    • ")
+                } else {
+                    String::from("Unknown")
+                };
+                
+                // Format IMDb ID display (with clickable link if available)
+                let imdb_display = if !movie.imdb_id.is_empty() {
+                    format!("{} (https://www.imdb.com/title/{})", movie.imdb_id, movie.imdb_id)
+                } else {
+                    String::from("Not available")
+                };
+                
+                let details = format!(
+                    "<b>{}</b> ({})\n\n\
+                    <b>Director:</b> {}\n\
+                    <b>Genre:</b> {}\n\
+                    <b>Rating:</b> ⭐ {:.1}/10\n\
+                    <b>Runtime:</b> {} minutes\n\n\
+                    <b>Starring:</b>\n    • {}\n\n\
+                    <b>Description:</b>\n{}\n\n\
+                    <b>File:</b> {}\n\
+                    <b>TMDB ID:</b> {}\n\
+                    <b>IMDb ID:</b> {}",
+                    escaped_title, movie.year, escaped_director,
+                    escaped_genre, movie.rating, movie.runtime,
+                    cast_display, escaped_description, escaped_file,
+                    movie.tmdb_id, imdb_display
+                );
+                details_label_clone.set_markup(&details);
             }
         }
     });
@@ -1777,7 +1983,7 @@ fn build_ui(app: &Application) {
                                         .collect();
                                     
                                     let poster_url = details.poster_path
-                                        .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                        .map(|p| format!("https://image.tmdb.org/t/p/original{}", p))
                                         .unwrap_or_default();
                                     
                                     let poster_path = if !poster_url.is_empty() {
@@ -1852,6 +2058,215 @@ fn build_ui(app: &Application) {
                 }
             });
         }
+    });
+
+    // Refresh All button - refresh metadata for ALL movies
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    let list_box_clone = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
+    let status_bar_clone = status_bar.clone();
+    let poster_cache_clone = poster_cache.clone();
+    let is_grid_view_clone = is_grid_view.clone();
+    refresh_all_button.connect_clicked(move |_| {
+        // Confirm with user
+        let dialog = gtk::AlertDialog::builder()
+            .message("Refresh All Movies")
+            .detail("This will refresh metadata and download HD posters for ALL movies in your database.\n\nThis may take a while depending on your collection size. Continue?")
+            .buttons(vec!["Cancel", "Refresh All"])
+            .cancel_button(0)
+            .default_button(1)
+            .build();
+        
+        let db_clone2 = db_clone.clone();
+        let list_box_clone2 = list_box_clone.clone();
+        let grid_flow_clone2 = grid_flow_clone.clone();
+        let status_bar_clone2 = status_bar_clone.clone();
+        let poster_cache_clone2 = poster_cache_clone.clone();
+        let is_grid_view_clone2 = is_grid_view_clone.clone();
+        
+        dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
+            if let Ok(1) = response {
+                status_bar_clone2.set_text("Starting refresh of all movies...");
+                
+                // Get all movies
+                let movies: Vec<(u32, String, String)> = db_clone2.borrow()
+                    .movies
+                    .values()
+                    .map(|m| (m.id, m.title.clone(), m.file_path.clone()))
+                    .collect();
+                
+                let total_count = movies.len();
+                let api_key = db_clone2.borrow().tmdb_api_key.clone();
+                
+                let (sender, receiver) = async_channel::unbounded::<(String, Option<(u32, Movie)>)>();
+                
+                // Spawn background thread to refresh all movies
+                std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let mut success_count = 0;
+                    let mut fail_count = 0;
+                    
+                    for (i, (movie_id, title, file_path)) in movies.iter().enumerate() {
+                        let progress = format!("Refreshing {}/{}: {}", i + 1, total_count, title);
+                        let _ = sender.send_blocking((progress, None));
+                        
+                        // Search TMDB
+                        let search_url = format!(
+                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                            api_key,
+                            urlencoding::encode(title)
+                        );
+                        
+                        if let Ok(response) = client.get(&search_url).send() {
+                            if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
+                                if !search_response.results.is_empty() {
+                                    let tmdb_movie_id = search_response.results[0].id;
+                                    let details_url = format!(
+                                        "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
+                                        tmdb_movie_id, api_key
+                                    );
+                                    
+                                    if let Ok(details_response) = client.get(&details_url).send() {
+                                        if let Ok(details) = details_response.json::<TMDBMovieDetails>() {
+                                            // Build movie (same as refresh single)
+                                            let year: u16 = details.release_date
+                                                .split('-')
+                                                .next()
+                                                .and_then(|y| y.parse().ok())
+                                                .unwrap_or(0);
+                                            
+                                            let director = details.credits.crew
+                                                .iter()
+                                                .find(|c| c.job == "Director")
+                                                .map(|c| c.name.clone())
+                                                .unwrap_or_else(|| "Unknown".to_string());
+                                            
+                                            let cast: Vec<String> = details.credits.cast
+                                                .iter()
+                                                .take(5)
+                                                .map(|c| c.name.clone())
+                                                .collect();
+                                            
+                                            let cast_details: Vec<CastMember> = details.credits.cast
+                                                .iter()
+                                                .take(5)
+                                                .map(|c| CastMember {
+                                                    name: c.name.clone(),
+                                                    character: c.character.clone(),
+                                                    profile_path: c.profile_path.as_ref()
+                                                        .map(|p| format!("https://image.tmdb.org/t/p/w185{}", p))
+                                                        .unwrap_or_default(),
+                                                })
+                                                .collect();
+                                            
+                                            let genres: Vec<String> = details.genres
+                                                .iter()
+                                                .map(|g| g.name.clone())
+                                                .collect();
+                                            
+                                            let poster_url = details.poster_path
+                                                .map(|p| format!("https://image.tmdb.org/t/p/original{}", p))
+                                                .unwrap_or_default();
+                                            
+                                            let poster_path = if !poster_url.is_empty() {
+                                                download_poster(&poster_url, tmdb_movie_id).unwrap_or_default()
+                                            } else {
+                                                String::new()
+                                            };
+                                            
+                                            // Fetch IMDb ID
+                                            let external_ids_url = format!(
+                                                "https://api.themoviedb.org/3/movie/{}/external_ids?api_key={}",
+                                                tmdb_movie_id, api_key
+                                            );
+                                            
+                                            let imdb_id = if let Ok(response) = reqwest::blocking::get(&external_ids_url) {
+                                                if let Ok(external_ids) = response.json::<TMDBExternalIds>() {
+                                                    external_ids.imdb_id.unwrap_or_default()
+                                                } else {
+                                                    String::new()
+                                                }
+                                            } else {
+                                                String::new()
+                                            };
+                                            
+                                            let movie = Movie {
+                                                id: 0,
+                                                title: details.title,
+                                                year,
+                                                director,
+                                                genre: if genres.is_empty() { vec!["Unknown".to_string()] } else { genres },
+                                                rating: details.vote_average,
+                                                runtime: details.runtime.unwrap_or(0),
+                                                description: details.overview,
+                                                cast,
+                                                cast_details,
+                                                file_path: file_path.clone(),
+                                                poster_url,
+                                                tmdb_id: tmdb_movie_id,
+                                                imdb_id,
+                                                poster_path,
+                                            };
+                                            
+                                            let _ = sender.send_blocking((String::new(), Some((*movie_id, movie))));
+                                            success_count += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        fail_count += 1;
+                    }
+                    
+                    let summary = format!("Refresh complete! {} succeeded, {} failed", success_count, fail_count);
+                    let _ = sender.send_blocking((summary, None));
+                });
+                
+                // Handle updates on main thread
+                glib::spawn_future_local(async move {
+                    let mut updated_ids = Vec::new();
+                    
+                    while let Ok((status, movie_opt)) = receiver.recv().await {
+                        if !status.is_empty() {
+                            status_bar_clone2.set_text(&status);
+                        }
+                        
+                        if let Some((old_id, new_movie)) = movie_opt {
+                            db_clone2.borrow_mut().delete_movie(old_id);
+                            db_clone2.borrow_mut().add_movie(new_movie);
+                            updated_ids.push(old_id);
+                        } else if status.contains("complete") {
+                            // Refresh UI
+                            let is_grid = *is_grid_view_clone2.borrow();
+                            
+                            if is_grid {
+                                while let Some(child) = grid_flow_clone2.first_child() {
+                                    grid_flow_clone2.remove(&child);
+                                }
+                                let movies = db_clone2.borrow().list_all();
+                                for movie in &movies {
+                                    let item = create_movie_grid_item(&movie, &poster_cache_clone2);
+                                    grid_flow_clone2.append(&item);
+                                }
+                            } else {
+                                while let Some(child) = list_box_clone2.first_child() {
+                                    list_box_clone2.remove(&child);
+                                }
+                                let movies = db_clone2.borrow().list_all();
+                                for movie in &movies {
+                                    let row = create_movie_row(&movie, &poster_cache_clone2);
+                                    list_box_clone2.append(&row);
+                                }
+                            }
+                            
+                            break;
+                        }
+                    }
+                });
+            }
+        });
     });
 
     // Edit Metadata button
@@ -2367,7 +2782,7 @@ fn build_ui(app: &Application) {
                                                 .collect();
                                             
                                             let poster_url = details.poster_path
-                                                .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                                .map(|p| format!("https://image.tmdb.org/t/p/original{}", p))
                                                 .unwrap_or_default();
                                             
                                             let poster_path = if !poster_url.is_empty() {
@@ -2785,7 +3200,7 @@ fn build_ui(app: &Application) {
                                                     .collect();
                                                 
                                                 let poster_url = details.poster_path
-                                                    .map(|p| format!("https://image.tmdb.org/t/p/w500{}", p))
+                                                    .map(|p| format!("https://image.tmdb.org/t/p/original{}", p))
                                                     .unwrap_or_default();
                                                 
                                                 let poster_path = if !poster_url.is_empty() {
