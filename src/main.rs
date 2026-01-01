@@ -188,7 +188,9 @@ struct MovieDatabase {
     #[serde(default)]
     tmdb_cache: HashMap<String, CachedTMDBSearch>,  // search_query -> cached results
     #[serde(skip)]  // Don't serialize pixbufs (can't serialize)
-    poster_cache: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> cached pixbuf
+    poster_cache_thumb: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> small thumbnail (60×90)
+    #[serde(skip)]
+    poster_cache_grid: Rc<RefCell<HashMap<u32, Pixbuf>>>,   // movie_id -> grid thumbnail (160×240)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,7 +363,8 @@ impl MovieDatabase {
             data_file: data_file.to_string(),
             tmdb_api_key: api_key.to_string(),
             tmdb_cache: HashMap::new(),
-            poster_cache: Rc::new(RefCell::new(HashMap::new())),
+            poster_cache_thumb: Rc::new(RefCell::new(HashMap::new())),
+            poster_cache_grid: Rc::new(RefCell::new(HashMap::new())),
         };
         db.load_from_file();
         db
@@ -481,7 +484,7 @@ impl MovieDatabase {
     }
 }
 
-fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::ListBoxRow {
+fn create_movie_row(movie: &Movie, _poster_cache_thumb: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     
     // Store the movie ID in the row's name property for later retrieval
@@ -493,41 +496,15 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     hbox.set_margin_top(8);
     hbox.set_margin_bottom(8);
 
-    // Add poster thumbnail
+    // Add poster placeholder - will be loaded lazily
     let poster_box = Box::new(Orientation::Vertical, 0);
     poster_box.set_size_request(60, 90);
+    poster_box.set_widget_name("poster_placeholder");  // Mark as placeholder
     
-    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        // Check cache first
-        let mut cache = poster_cache.borrow_mut();
-        
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Use cached pixbuf and scale for display (FAST!)
-            if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
-            }
-        } else {
-            // Load FULL RESOLUTION from disk and cache it
-            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                // Cache the FULL resolution
-                cache.insert(movie.id, pixbuf.clone());
-                
-                // Scale for display
-                if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let picture = Picture::for_pixbuf(&scaled);
-                    picture.set_can_shrink(true);
-                    poster_box.append(&picture);
-                }
-            }
-        }
-    } else {
-        // Placeholder for missing poster
-        let placeholder = Label::new(Some("🎬"));
-        placeholder.set_markup("<span size='xx-large'>🎬</span>");
-        poster_box.append(&placeholder);
-    }
+    // Initially show placeholder instead of loading poster
+    let placeholder = Label::new(Some("🎬"));
+    placeholder.set_markup("<span size='xx-large'>🎬</span>");
+    poster_box.append(&placeholder);
     
     hbox.append(&poster_box);
 
@@ -558,45 +535,70 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     row
 }
 
-fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::FlowBoxChild {
+// Load poster for a row (called lazily when row becomes visible)
+fn load_poster_for_row(row: &gtk::ListBoxRow, movie: &Movie, poster_cache_thumb: &Rc<RefCell<HashMap<u32, Pixbuf>>>) {
+    if let Some(child) = row.child() {
+        if let Some(hbox) = child.downcast_ref::<Box>() {
+            if let Some(poster_box) = hbox.first_child() {
+                if let Some(poster_box) = poster_box.downcast_ref::<Box>() {
+                    // Check if already loaded
+                    if poster_box.widget_name() != "poster_placeholder" {
+                        return; // Already loaded
+                    }
+                    
+                    // Clear placeholder
+                    while let Some(child) = poster_box.first_child() {
+                        poster_box.remove(&child);
+                    }
+                    
+                    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+                        let mut cache = poster_cache_thumb.borrow_mut();
+                        
+                        if let Some(pixbuf) = cache.get(&movie.id) {
+                            // Use cached thumbnail
+                            let picture = Picture::for_pixbuf(pixbuf);
+                            picture.set_can_shrink(true);
+                            poster_box.append(&picture);
+                        } else {
+                            // Load from disk at thumbnail size and cache it
+                            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 60, 90, true) {
+                                cache.insert(movie.id, pixbuf.clone());
+                                
+                                let picture = Picture::for_pixbuf(&pixbuf);
+                                picture.set_can_shrink(true);
+                                poster_box.append(&picture);
+                            }
+                        }
+                    } else {
+                        // Keep placeholder for missing poster
+                        let placeholder = Label::new(Some("🎬"));
+                        placeholder.set_markup("<span size='xx-large'>🎬</span>");
+                        poster_box.append(&placeholder);
+                    }
+                    
+                    poster_box.set_widget_name("poster_loaded");  // Mark as loaded
+                }
+            }
+        }
+    }
+}
+
+fn create_movie_grid_item(movie: &Movie, _poster_cache_grid: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::FlowBoxChild {
     let child = gtk::FlowBoxChild::new();
     child.set_widget_name(&movie.id.to_string());
     
     let vbox = Box::new(Orientation::Vertical, 8);
     vbox.set_size_request(180, 320);
     
-    // Poster
+    // Poster placeholder - will be loaded lazily
     let poster_box = Box::new(Orientation::Vertical, 0);
     poster_box.set_size_request(160, 240);
+    poster_box.set_widget_name("poster_placeholder");  // Mark as placeholder
     
-    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        let mut cache = poster_cache.borrow_mut();
-        
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Scale cached full-res for grid view (larger)
-            if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
-            }
-        } else {
-            // Load FULL RESOLUTION and cache it
-            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                cache.insert(movie.id, pixbuf.clone());
-                
-                // Scale for display
-                if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let picture = Picture::for_pixbuf(&scaled);
-                    picture.set_can_shrink(true);
-                    poster_box.append(&picture);
-                }
-            }
-        }
-    } else {
-        let placeholder = Label::new(Some("🎬"));
-        placeholder.set_markup("<span size='70000'>🎬</span>");
-        poster_box.append(&placeholder);
-    }
+    // Initially show placeholder
+    let placeholder = Label::new(Some("🎬"));
+    placeholder.set_markup("<span size='70000'>🎬</span>");
+    poster_box.append(&placeholder);
     
     vbox.append(&poster_box);
     
@@ -618,6 +620,54 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
     
     child.set_child(Some(&vbox));
     child
+}
+
+// Load poster for a grid item (called lazily when item becomes visible)
+fn load_poster_for_grid_item(child: &gtk::FlowBoxChild, movie: &Movie, poster_cache_grid: &Rc<RefCell<HashMap<u32, Pixbuf>>>) {
+    if let Some(vbox) = child.child() {
+        if let Some(vbox) = vbox.downcast_ref::<Box>() {
+            if let Some(poster_box) = vbox.first_child() {
+                if let Some(poster_box) = poster_box.downcast_ref::<Box>() {
+                    // Check if already loaded
+                    if poster_box.widget_name() != "poster_placeholder" {
+                        return; // Already loaded
+                    }
+                    
+                    // Clear placeholder
+                    while let Some(child) = poster_box.first_child() {
+                        poster_box.remove(&child);
+                    }
+                    
+                    if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
+                        let mut cache = poster_cache_grid.borrow_mut();
+                        
+                        if let Some(pixbuf) = cache.get(&movie.id) {
+                            // Use cached grid thumbnail
+                            let picture = Picture::for_pixbuf(pixbuf);
+                            picture.set_can_shrink(true);
+                            poster_box.append(&picture);
+                        } else {
+                            // Load from disk at grid size and cache it
+                            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
+                                cache.insert(movie.id, pixbuf.clone());
+                                
+                                let picture = Picture::for_pixbuf(&pixbuf);
+                                picture.set_can_shrink(true);
+                                poster_box.append(&picture);
+                            }
+                        }
+                    } else {
+                        // Keep placeholder
+                        let placeholder = Label::new(Some("🎬"));
+                        placeholder.set_markup("<span size='70000'>🎬</span>");
+                        poster_box.append(&placeholder);
+                    }
+                    
+                    poster_box.set_widget_name("poster_loaded");  // Mark as loaded
+                }
+            }
+        }
+    }
 }
 
 fn show_api_key_dialog(window: &ApplicationWindow) -> Option<String> {
@@ -755,8 +805,9 @@ fn build_ui(app: &Application) {
 
     let db = Rc::new(RefCell::new(MovieDatabase::new("movies.db", &api_key)));
     
-    // Get poster cache reference for passing to create_movie_row
-    let poster_cache = db.borrow().poster_cache.clone();
+    // Get poster cache references for passing to functions
+    let poster_cache_thumb = db.borrow().poster_cache_thumb.clone();
+    let poster_cache_grid = db.borrow().poster_cache_grid.clone();
 
     let main_box = Box::new(Orientation::Vertical, 0);
 
@@ -944,7 +995,7 @@ fn build_ui(app: &Application) {
     let list_box_clone_toggle = list_box.clone();
     let grid_flow_clone = grid_flow.clone();
     let db_clone_toggle = db.clone();
-    let poster_cache_clone_toggle = poster_cache.clone();
+    let poster_cache_grid_clone = poster_cache_grid.clone();
     
     view_toggle.connect_clicked(move |button| {
         let mut is_grid = is_grid_view_clone.borrow_mut();
@@ -961,7 +1012,7 @@ fn build_ui(app: &Application) {
             }
             let movies = db_clone_toggle.borrow().list_all();
             for movie in &movies {
-                let item = create_movie_grid_item(&movie, &poster_cache_clone_toggle);
+                let item = create_movie_grid_item(&movie, &poster_cache_grid_clone);
                 grid_flow_clone.append(&item);
             }
         } else {
@@ -975,7 +1026,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let movies = db_clone.borrow().list_all();
     for movie in &movies {
-        let row = create_movie_row(movie, &poster_cache);
+        let row = create_movie_row(movie, &poster_cache_thumb);
         list_box.append(&row);
     }
 
@@ -986,7 +1037,7 @@ fn build_ui(app: &Application) {
         let list_box_clone = list_box.clone();
         let status_bar_clone = status_bar.clone();
         let window_clone = window.clone();
-        let poster_cache_clone = poster_cache.clone();
+        let poster_cache_thumb_clone = poster_cache_thumb.clone();
         
         // Ask user if they want to scan
         let dialog = gtk::AlertDialog::builder()
@@ -1128,7 +1179,7 @@ fn build_ui(app: &Application) {
                                 new_movies_count += 1;
                                 
                                 // Add to UI
-                                let row = create_movie_row(&movie, &poster_cache_clone);
+                                let row = create_movie_row(&movie, &poster_cache_thumb_clone);
                                 list_box_clone.append(&row);
                             }
                         }
@@ -1162,7 +1213,8 @@ fn build_ui(app: &Application) {
         search_query: &str,
         genre_filter: &str,
         sort_by: &str,
-        poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
+        poster_cache_thumb: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
+        poster_cache_grid: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
     ) {
         // Clear existing items from both views
         while let Some(child) = list_box.first_child() {
@@ -1207,12 +1259,12 @@ fn build_ui(app: &Application) {
         // Populate the active view
         if is_grid_view {
             for movie in &results {
-                let item = create_movie_grid_item(movie, poster_cache);
+                let item = create_movie_grid_item(movie, poster_cache_grid);
                 grid_flow.append(&item);
             }
         } else {
             for movie in &results {
-                let row = create_movie_row(movie, poster_cache);
+                let row = create_movie_row(movie, poster_cache_thumb);
                 list_box.append(&row);
             }
         }
@@ -1224,7 +1276,8 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_thumb_clone = poster_cache_thumb.clone();
+    let poster_cache_grid_clone = poster_cache_grid.clone();
     let is_grid_view_clone = is_grid_view.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text();
@@ -1237,7 +1290,7 @@ fn build_ui(app: &Application) {
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_thumb_clone, &poster_cache_grid_clone);
     });
 
     // Genre filter
@@ -1246,7 +1299,8 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_thumb_clone = poster_cache_thumb.clone();
+    let poster_cache_grid_clone = poster_cache_grid.clone();
     let is_grid_view_clone = is_grid_view.clone();
     genre_dropdown.connect_selected_notify(move |dropdown| {
         let selected_idx = dropdown.selected();
@@ -1259,7 +1313,7 @@ fn build_ui(app: &Application) {
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_thumb_clone, &poster_cache_grid_clone);
     });
     
     // Sort dropdown
@@ -1268,7 +1322,8 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_thumb_clone = poster_cache_thumb.clone();
+    let poster_cache_grid_clone = poster_cache_grid.clone();
     let is_grid_view_clone = is_grid_view.clone();
     sort_dropdown.connect_selected_notify(move |dropdown| {
         let sort_idx = dropdown.selected();
@@ -1281,13 +1336,14 @@ fn build_ui(app: &Application) {
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_thumb_clone, &poster_cache_grid_clone);
     });
 
     // Movie selection
     let details_label_clone = details_label.clone();
     let poster_display_clone = poster_display.clone();
     let db_clone = db.clone();
+    let poster_cache_thumb_clone = db.borrow().poster_cache_thumb.clone();
     let selected_movie_id = Rc::new(RefCell::new(0u32));
     let selected_movie_id_clone = selected_movie_id.clone();
     
@@ -1301,12 +1357,14 @@ fn build_ui(app: &Application) {
                 // Get the actual movie from the database by ID
                 let db = db_clone.borrow();
                 if let Some(movie) = db.movies.get(&movie_id) {
-                    // Update poster - load full resolution then scale for display
+                    // Lazy load poster for this row if not already loaded
+                    load_poster_for_row(row, movie, &poster_cache_thumb_clone);
+                    
+                    // Update poster - load full HD on-demand (no caching for details to save memory)
                     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-                        if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                            if let Some(scaled) = pixbuf.scale_simple(200, 300, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                                poster_display_clone.set_pixbuf(Some(&scaled));
-                            }
+                        // Load at details panel size for best quality
+                        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
+                            poster_display_clone.set_pixbuf(Some(&pixbuf));
                         }
                     } else {
                         poster_display_clone.set_pixbuf(None);
@@ -1362,6 +1420,7 @@ fn build_ui(app: &Application) {
     let details_label_clone = details_label.clone();
     let poster_display_clone = poster_display.clone();
     let db_clone = db.clone();
+    let poster_cache_grid_clone = db.borrow().poster_cache_grid.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
     
     grid_flow.connect_child_activated(move |_, child| {
@@ -1373,12 +1432,13 @@ fn build_ui(app: &Application) {
             // Get the actual movie from the database by ID
             let db = db_clone.borrow();
             if let Some(movie) = db.movies.get(&movie_id) {
-                // Update poster - load full resolution then scale for display
+                // Lazy load poster for this grid item if not already loaded
+                load_poster_for_grid_item(child, movie, &poster_cache_grid_clone);
+                
+                // Update poster - load at display size for best quality
                 if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-                    if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                        if let Some(scaled) = pixbuf.scale_simple(200, 300, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                            poster_display_clone.set_pixbuf(Some(&scaled));
-                        }
+                    if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 200, 300, true) {
+                        poster_display_clone.set_pixbuf(Some(&pixbuf));
                     }
                 } else {
                     poster_display_clone.set_pixbuf(None);
@@ -1479,7 +1539,7 @@ fn build_ui(app: &Application) {
     let selected_movie_id_clone = selected_movie_id.clone();
     let details_label_clone = details_label.clone();
     let list_box_clone = list_box.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_clone = poster_cache_thumb.clone();
     associate_file_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -1494,7 +1554,7 @@ fn build_ui(app: &Application) {
         let db_clone2 = db_clone.clone();
         let details_label_clone2 = details_label_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
-        let poster_cache_clone2 = poster_cache_clone.clone();
+        let poster_cache_thumb2 = poster_cache_clone.clone();
         file_dialog.open(Some(&window_clone), gtk::gio::Cancellable::NONE, move |result| {
             if let Ok(file) = result {
                 if let Some(path) = file.path() {
@@ -1565,7 +1625,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie, &poster_cache_clone2);
+                            let row = create_movie_row(movie, &poster_cache_thumb2);
                             list_box_clone2.append(&row);
                         }
                     }
@@ -1579,7 +1639,7 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let window_clone = window.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_clone = poster_cache_thumb.clone();
     delete_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id > 0 {
@@ -1593,7 +1653,7 @@ fn build_ui(app: &Application) {
 
             let db_clone2 = db_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
-            let poster_cache_clone2 = poster_cache_clone.clone();
+            let poster_cache_thumb2 = poster_cache_clone.clone();
             dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
                 if let Ok(1) = response {
                     if db_clone2.borrow_mut().delete_movie(movie_id) {
@@ -1602,7 +1662,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie, &poster_cache_clone2);
+                            let row = create_movie_row(movie, &poster_cache_thumb2);
                             list_box_clone2.append(&row);
                         }
                     }
@@ -1761,7 +1821,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_clone = poster_cache_thumb.clone();
     scan_button.connect_clicked(move |_| {
         let dialog = gtk::FileDialog::new();
         dialog.set_title("Select Movie Directory");
@@ -1769,7 +1829,7 @@ fn build_ui(app: &Application) {
         let db_clone2 = db_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
-        let poster_cache_clone2 = poster_cache_clone.clone();
+        let poster_cache_thumb2 = poster_cache_clone.clone();
         dialog.select_folder(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |result| {
             if let Ok(folder) = result {
                 if let Some(path) = folder.path() {
@@ -1898,7 +1958,7 @@ fn build_ui(app: &Application) {
                                     }
                                     let movies = db_clone3.borrow().list_all();
                                     for movie in &movies {
-                                        let row = create_movie_row(movie, &poster_cache_clone2);
+                                        let row = create_movie_row(movie, &poster_cache_thumb2);
                                         list_box_clone3.append(&row);
                                     }
                                     status_bar_clone3.set_text("Scan complete!");
@@ -1918,14 +1978,14 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
     let status_bar_clone = status_bar.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_clone = poster_cache_thumb.clone();
     refresh_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id > 0 {
             let db_clone2 = db_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
             let status_bar_clone2 = status_bar_clone.clone();
-            let poster_cache_clone2 = poster_cache_clone.clone();
+            let poster_cache_thumb2 = poster_cache_clone.clone();
             
             // Get the data we need before spawning thread
             let (title, file_path, api_key) = {
@@ -2062,7 +2122,7 @@ fn build_ui(app: &Application) {
                         }
                         let movies = db_clone2.borrow().list_all();
                         for movie in &movies {
-                            let row = create_movie_row(movie, &poster_cache_clone2);
+                            let row = create_movie_row(movie, &poster_cache_thumb2);
                             list_box_clone2.append(&row);
                         }
                         status_bar_clone2.set_text("Metadata refreshed!");
@@ -2080,7 +2140,8 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let grid_flow_clone = grid_flow.clone();
     let status_bar_clone = status_bar.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_thumb_clone = poster_cache_thumb.clone();
+    let poster_cache_grid_clone = poster_cache_grid.clone();
     let is_grid_view_clone = is_grid_view.clone();
     refresh_all_button.connect_clicked(move |_| {
         // Confirm with user
@@ -2096,7 +2157,8 @@ fn build_ui(app: &Application) {
         let list_box_clone2 = list_box_clone.clone();
         let grid_flow_clone2 = grid_flow_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
-        let poster_cache_clone2 = poster_cache_clone.clone();
+        let poster_cache_thumb2 = poster_cache_thumb_clone.clone();
+        let poster_cache_grid2 = poster_cache_grid_clone.clone();
         let is_grid_view_clone2 = is_grid_view_clone.clone();
         
         dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
@@ -2261,7 +2323,7 @@ fn build_ui(app: &Application) {
                                 }
                                 let movies = db_clone2.borrow().list_all();
                                 for movie in &movies {
-                                    let item = create_movie_grid_item(&movie, &poster_cache_clone2);
+                                    let item = create_movie_grid_item(&movie, &poster_cache_grid2);
                                     grid_flow_clone2.append(&item);
                                 }
                             } else {
@@ -2270,7 +2332,7 @@ fn build_ui(app: &Application) {
                                 }
                                 let movies = db_clone2.borrow().list_all();
                                 for movie in &movies {
-                                    let row = create_movie_row(&movie, &poster_cache_clone2);
+                                    let row = create_movie_row(&movie, &poster_cache_thumb2);
                                     list_box_clone2.append(&row);
                                 }
                             }
@@ -2290,7 +2352,7 @@ fn build_ui(app: &Application) {
     let details_label_clone = details_label.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
-    let poster_cache_clone = poster_cache.clone();
+    let poster_cache_clone = poster_cache_thumb.clone();
     edit_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -2402,7 +2464,7 @@ fn build_ui(app: &Application) {
             let details_label_clone2 = details_label_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
             let status_bar_clone2 = status_bar_clone.clone();
-            let poster_cache_clone2 = poster_cache_clone.clone();
+            let poster_cache_thumb2 = poster_cache_clone.clone();
             save_button.connect_clicked(move |_| {
                 // Parse and validate inputs
                 let new_title = title_entry.text().to_string();
@@ -2500,7 +2562,7 @@ fn build_ui(app: &Application) {
                 }
                 let movies = db_clone2.borrow().list_all();
                 for movie in &movies {
-                    let row = create_movie_row(movie, &poster_cache_clone2);
+                    let row = create_movie_row(movie, &poster_cache_thumb2);
                     list_box_clone2.append(&row);
                 }
                 
@@ -2518,7 +2580,7 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
-    let poster_cache_clone_select = poster_cache.clone();
+    let poster_cache_clone_select = poster_cache_thumb.clone();
     select_version_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -2846,7 +2908,7 @@ fn build_ui(app: &Application) {
                                     let _ = sender2.send_blocking(None);
                                 });
                                 
-                                let poster_cache_clone_select3 = poster_cache_clone_select2.clone();
+                                let poster_cache_thumb3 = poster_cache_clone_select2.clone();
                                 glib::spawn_future_local(async move {
                                     if let Ok(Some((old_id, new_movie))) = receiver2.recv().await {
                                         db_clone3.borrow_mut().delete_movie(old_id);
@@ -2859,7 +2921,7 @@ fn build_ui(app: &Application) {
                                         
                                         let movies = db_clone3.borrow().list_all();
                                         for movie in &movies {
-                                            let row = create_movie_row(movie, &poster_cache_clone_select3);
+                                            let row = create_movie_row(movie, &poster_cache_thumb3);
                                             list_box_clone3.append(&row);
                                         }
                                         
@@ -2881,7 +2943,7 @@ fn build_ui(app: &Application) {
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
-    let poster_cache_clone_add = poster_cache.clone();
+    let poster_cache_clone_add = poster_cache_thumb.clone();
     add_button.connect_clicked(move |_| {
         let dialog = Window::builder()
             .title("Add New Movie")
@@ -3264,12 +3326,12 @@ fn build_ui(app: &Application) {
                                         let _ = sender2.send_blocking(None);
                                     });
                                     
-                                    let poster_cache_clone_add4 = poster_cache_clone_add3.clone();
+                                    let poster_cache_thumb4 = poster_cache_clone_add3.clone();
                                     glib::spawn_future_local(async move {
                                         if let Ok(Some((title, movie))) = receiver2.recv().await {
                                             db_clone4.borrow_mut().add_movie(movie.clone());
                                             
-                                            let row = create_movie_row(&movie, &poster_cache_clone_add4);
+                                            let row = create_movie_row(&movie, &poster_cache_thumb4);
                                             list_box_clone4.append(&row);
                                             
                                             status_bar_clone4.set_text(&format!("Added: {}", title));
