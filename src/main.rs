@@ -767,10 +767,23 @@ fn build_ui(app: &Application) {
     scrolled.set_child(Some(&list_box));
     main_box.append(&scrolled);
 
+    // Container for details section with toggle
+    let details_container = Box::new(Orientation::Vertical, 0);
+    
+    // Toggle button bar
+    let toggle_bar = Box::new(Orientation::Horizontal, 0);
+    toggle_bar.set_margin_start(12);
+    toggle_bar.set_margin_end(12);
+    
+    let toggle_button = Button::with_label("▼ Hide Details");
+    toggle_button.set_tooltip_text(Some("Click to show/hide movie details"));
+    toggle_bar.append(&toggle_button);
+    details_container.append(&toggle_bar);
+
     let details_frame = Frame::new(Some("Movie Details"));
     details_frame.set_margin_start(12);
     details_frame.set_margin_end(12);
-    details_frame.set_margin_top(12);
+    details_frame.set_margin_top(0);
     details_frame.set_margin_bottom(12);
 
     let details_main_box = Box::new(Orientation::Horizontal, 12);
@@ -808,9 +821,29 @@ fn build_ui(app: &Application) {
 
     details_main_box.append(&details_box);
     details_frame.set_child(Some(&details_main_box));
-    main_box.append(&details_frame);
+    details_container.append(&details_frame);
+    
+    main_box.append(&details_container);
+    
+    // Toggle button handler
+    let details_frame_clone = details_frame.clone();
+    let is_visible = Rc::new(RefCell::new(true));
+    let is_visible_clone = is_visible.clone();
+    toggle_button.connect_clicked(move |button| {
+        let mut visible = is_visible_clone.borrow_mut();
+        *visible = !*visible;
+        
+        if *visible {
+            details_frame_clone.set_visible(true);
+            button.set_label("▼ Hide Details");
+        } else {
+            details_frame_clone.set_visible(false);
+            button.set_label("▲ Show Details");
+        }
+    });
 
     window.set_child(Some(&main_box));
+
 
     // Populate initial list
     let db_clone = db.clone();
@@ -2068,13 +2101,14 @@ fn build_ui(app: &Application) {
         if let Some(movie) = db.movies.get(&movie_id) {
             let movie_title = movie.title.clone();
             let movie_title_for_ui = movie_title.clone(); // Clone for UI updates
+            let movie_year = movie.year; // Get the year for search
             let file_path = movie.file_path.clone();
             let api_key = db.tmdb_api_key.clone();
             drop(db); // Release borrow
             
             // Create selection dialog
             let selection_dialog = Window::builder()
-                .title(&format!("Select Version: {}", movie_title))
+                .title(&format!("Select Version: {} ({})", movie_title, if movie_year > 0 { movie_year.to_string() } else { "Unknown year".to_string() }))
                 .modal(true)
                 .transient_for(&window_clone)
                 .default_width(600)
@@ -2087,7 +2121,12 @@ fn build_ui(app: &Application) {
             dialog_box.set_margin_top(20);
             dialog_box.set_margin_bottom(20);
             
-            let instruction = Label::new(Some(&format!("Select the correct version of \"{}\":", movie_title)));
+            let instruction_text = if movie_year > 0 {
+                format!("Select the correct version of \"{}\" ({}):", movie_title, movie_year)
+            } else {
+                format!("Select the correct version of \"{}\":", movie_title)
+            };
+            let instruction = Label::new(Some(&instruction_text));
             instruction.set_xalign(0.0);
             dialog_box.append(&instruction);
             
@@ -2134,9 +2173,13 @@ fn build_ui(app: &Application) {
             
             let (sender, receiver) = async_channel::unbounded::<Vec<(u32, String, String, f32)>>();
             
-            // Check cache first
-            let movie_title_for_cache = movie_title.clone();
-            let cached_results = db_clone2.borrow().get_cached_search(&movie_title_for_cache);
+            // Check cache first - include year in cache key for more specific caching
+            let cache_key = if movie_year > 0 {
+                format!("{} ({})", movie_title, movie_year)
+            } else {
+                movie_title.clone()
+            };
+            let cached_results = db_clone2.borrow().get_cached_search(&cache_key);
             
             if let Some(results) = cached_results {
                 // Use cached results immediately!
@@ -2144,12 +2187,21 @@ fn build_ui(app: &Application) {
             } else {
                 // Fetch from TMDB and cache
                 std::thread::spawn(move || {
-                    // Search TMDB
-                    let search_url = format!(
-                        "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
-                        api_key,
-                        urlencoding::encode(&movie_title)
-                    );
+                    // Search TMDB with year parameter if available
+                    let search_url = if movie_year > 0 {
+                        format!(
+                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}&year={}",
+                            api_key,
+                            urlencoding::encode(&movie_title),
+                            movie_year
+                        )
+                    } else {
+                        format!(
+                            "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
+                            api_key,
+                            urlencoding::encode(&movie_title)
+                        )
+                    };
                     
                     if let Ok(response) = reqwest::blocking::get(&search_url) {
                         if let Ok(search_result) = response.json::<TMDBSearchResponse>() {
@@ -2191,14 +2243,14 @@ fn build_ui(app: &Application) {
             
             // Update UI with results
             let db_clone_for_cache = db_clone2.clone();
-            let movie_title_for_cache2 = movie_title_for_ui.clone();
+            let cache_key_for_save = cache_key.clone();
             let poster_cache_clone_select2 = poster_cache_clone_select.clone();
             glib::spawn_future_local(async move {
                 if let Ok(results) = receiver.recv().await {
                     // Cache the results if not from cache
                     if !results.is_empty() {
                         db_clone_for_cache.borrow_mut().cache_search_results(
-                            movie_title_for_cache2.clone(),
+                            cache_key_for_save.clone(),
                             results.clone()
                         );
                     }
