@@ -94,6 +94,13 @@ struct CastMember {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WatchLogEntry {
+    date: String,  // ISO format: "2026-01-01"
+    rating: Option<f32>,  // Personal rating 0-10
+    comments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Movie {
     id: u32,
     title: String,
@@ -114,6 +121,8 @@ struct Movie {
     imdb_id: String,  // IMDb ID (e.g., "tt0111161")
     #[serde(default)]
     poster_path: String,  // Local cached poster path
+    #[serde(default)]
+    watch_log: Vec<WatchLogEntry>,  // Watch history with comments
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +193,8 @@ struct MovieDatabase {
     next_id: u32,
     #[serde(skip)]  // Don't serialize file path
     data_file: String,
+    #[serde(skip)]  // Don't serialize posters directory path
+    posters_dir: String,
     tmdb_api_key: String,
     #[serde(default)]
     tmdb_cache: HashMap<String, CachedTMDBSearch>,  // search_query -> cached results
@@ -210,13 +221,12 @@ impl CachedTMDBSearch {
     }
 }
 
-fn download_poster(poster_url: &str, movie_id: u32) -> Option<String> {
+fn download_poster(poster_url: &str, movie_id: u32, posters_dir: &str) -> Option<String> {
     if poster_url.is_empty() {
         return None;
     }
     
     // Create posters directory if it doesn't exist
-    let posters_dir = "posters";
     create_dir_all(posters_dir).ok()?;
     
     // Download the poster
@@ -237,6 +247,7 @@ async fn fetch_movie_metadata_async(
     api_key: &str,
     title: &str,
     file_path: String,
+    posters_dir: String,
 ) -> Option<Movie> {
     let search_url = format!(
         "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
@@ -313,7 +324,7 @@ async fn fetch_movie_metadata_async(
         .unwrap_or_default();
     
     let poster_path = if !poster_url.is_empty() {
-        download_poster(&poster_url, movie_id).unwrap_or_default()
+        download_poster(&poster_url, movie_id, &posters_dir).unwrap_or_default()
     } else {
         String::new()
     };
@@ -350,15 +361,17 @@ async fn fetch_movie_metadata_async(
         tmdb_id: movie_id,
         imdb_id,
         poster_path,
+        watch_log: Vec::new(),
     })
 }
 
 impl MovieDatabase {
-    fn new(data_file: &str, api_key: &str) -> Self {
+    fn new(data_file: &str, posters_dir: &str, api_key: &str) -> Self {
         let mut db = MovieDatabase {
             movies: HashMap::new(),
             next_id: 1,
             data_file: data_file.to_string(),
+            posters_dir: posters_dir.to_string(),
             tmdb_api_key: api_key.to_string(),
             tmdb_cache: HashMap::new(),
             poster_cache: Rc::new(RefCell::new(HashMap::new())),
@@ -423,6 +436,10 @@ impl MovieDatabase {
                 self.next_id = loaded_db.next_id;
                 self.tmdb_api_key = loaded_db.tmdb_api_key;
                 self.tmdb_cache = loaded_db.tmdb_cache;
+                
+                // Migrate old poster paths to new location
+                self.migrate_poster_paths();
+                
                 return;
             }
         }
@@ -441,6 +458,31 @@ impl MovieDatabase {
                     }
                 }
             }
+        }
+    }
+
+    fn migrate_poster_paths(&mut self) {
+        // Update old poster paths to use new location
+        let mut needs_save = false;
+        
+        for movie in self.movies.values_mut() {
+            if !movie.poster_path.is_empty() {
+                // Check if using old "posters/" or "~/posters/" path
+                if movie.poster_path.starts_with("posters/") || movie.poster_path.starts_with("~/posters/") {
+                    // Extract just the filename
+                    if let Some(filename) = movie.poster_path.split('/').last() {
+                        // Update to new path
+                        let new_path = format!("{}/{}", self.posters_dir, filename);
+                        movie.poster_path = new_path;
+                        needs_save = true;
+                    }
+                }
+            }
+        }
+        
+        // Save if we made any changes
+        if needs_save {
+            self.save_to_file();
         }
     }
 
@@ -494,6 +536,9 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     hbox.set_margin_bottom(8);
 
     // Add poster thumbnail
+    let poster_container = gtk::Overlay::new();
+    poster_container.set_size_request(60, 90);
+    
     let poster_box = Box::new(Orientation::Vertical, 0);
     poster_box.set_size_request(60, 90);
     
@@ -529,7 +574,18 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
         poster_box.append(&placeholder);
     }
     
-    hbox.append(&poster_box);
+    poster_container.set_child(Some(&poster_box));
+    
+    // Add "SEEN" badge if movie has been watched
+    if !movie.watch_log.is_empty() {
+        let seen_label = Label::new(Some("SEEN"));
+        seen_label.set_markup("<span foreground='red' weight='bold' size='large'>SEEN</span>");
+        seen_label.set_halign(Align::Center);
+        seen_label.set_valign(Align::Center);
+        poster_container.add_overlay(&seen_label);
+    }
+    
+    hbox.append(&poster_container);
 
     let vbox = Box::new(Orientation::Vertical, 4);
     
@@ -565,7 +621,10 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
     let vbox = Box::new(Orientation::Vertical, 8);
     vbox.set_size_request(180, 320);
     
-    // Poster
+    // Poster with overlay
+    let poster_container = gtk::Overlay::new();
+    poster_container.set_size_request(160, 240);
+    
     let poster_box = Box::new(Orientation::Vertical, 0);
     poster_box.set_size_request(160, 240);
     
@@ -598,7 +657,18 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
         poster_box.append(&placeholder);
     }
     
-    vbox.append(&poster_box);
+    poster_container.set_child(Some(&poster_box));
+    
+    // Add "SEEN" badge if movie has been watched
+    if !movie.watch_log.is_empty() {
+        let seen_label = Label::new(Some("SEEN"));
+        seen_label.set_markup("<span foreground='red' weight='bold' size='x-large'>SEEN</span>");
+        seen_label.set_halign(Align::Center);
+        seen_label.set_valign(Align::Center);
+        poster_container.add_overlay(&seen_label);
+    }
+    
+    vbox.append(&poster_container);
     
     // Title and year
     let title_label = Label::new(Some(&format!("{} ({})", movie.title, movie.year)));
@@ -753,7 +823,17 @@ fn build_ui(app: &Application) {
         }
     };
 
-    let db = Rc::new(RefCell::new(MovieDatabase::new("movies.db", &api_key)));
+    // Create data directory in home folder for consistent storage
+    let data_dir = dirs::home_dir()
+        .expect("Could not find home directory")
+        .join(".movie_database");
+    std::fs::create_dir_all(&data_dir).expect("Could not create data directory");
+    
+    let db_path = data_dir.join("movies.db").to_string_lossy().to_string();
+    let posters_dir = data_dir.join("posters").to_string_lossy().to_string();
+    std::fs::create_dir_all(&posters_dir).expect("Could not create posters directory");
+
+    let db = Rc::new(RefCell::new(MovieDatabase::new(&db_path, &posters_dir, &api_key)));
     
     // Get poster cache reference for passing to create_movie_row
     let poster_cache = db.borrow().poster_cache.clone();
@@ -904,10 +984,12 @@ fn build_ui(app: &Application) {
     let action_box = Box::new(Orientation::Horizontal, 8);
     let play_button = Button::with_label("▶️ Play in VLC");
     let show_cast_button = Button::with_label("⭐ Show Cast");
+    let watch_log_button = Button::with_label("📝 Watch Log");
     let associate_file_button = Button::with_label("📎 Associate File");
     let delete_button = Button::with_label("🗑️ Delete");
     action_box.append(&play_button);
     action_box.append(&show_cast_button);
+    action_box.append(&watch_log_button);
     action_box.append(&associate_file_button);
     action_box.append(&delete_button);
     details_box.append(&action_box);
@@ -1003,6 +1085,7 @@ fn build_ui(app: &Application) {
         
         let scan_dirs = config.scan_directories.clone();
         let api_key = db_clone.borrow().tmdb_api_key.clone();
+        let posters_dir = db_clone.borrow().posters_dir.clone();
         
         dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
             if let Ok(1) = response {
@@ -1067,11 +1150,12 @@ fn build_ui(app: &Application) {
                                     let file_path = file_path_str.clone();
                                     let client = client.clone();
                                     let sender = sender.clone();
+                                    let posters_dir = posters_dir.clone();
                                     
                                     async move {
                                         let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                         
-                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone()).await {
+                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir.clone()).await {
                                             Some(movie) => {
                                                 let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                             }
@@ -1093,6 +1177,7 @@ fn build_ui(app: &Application) {
                                                     tmdb_id: 0,
                                                     imdb_id: String::new(),
                                                     poster_path: String::new(),
+                                                    watch_log: Vec::new(),
                                                 };
                                                 let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
                                             }
@@ -1438,27 +1523,57 @@ fn build_ui(app: &Application) {
         if movie_id > 0 {
             let db = db_clone.borrow();
             if let Some(movie) = db.movies.get(&movie_id) {
-                if !movie.file_path.is_empty() && Path::new(&movie.file_path).exists() {
+                let file_path = movie.file_path.clone();
+                let movie_title = movie.title.clone();
+                drop(db);  // Release borrow early
+                
+                if !file_path.is_empty() && Path::new(&file_path).exists() {
                     // Try to launch VLC with suppressed output
                     match Command::new("vlc")
-                        .arg(&movie.file_path)
+                        .arg(&file_path)
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .spawn()
                     {
                         Ok(_) => {
-                            status_bar_clone.set_text(&format!("Playing: {}", movie.title));
+                            // Auto-log to watch history
+                            let mut db_mut = db_clone.borrow_mut();
+                            if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                let entry = WatchLogEntry {
+                                    date: today,
+                                    rating: None,
+                                    comments: String::from("Watched"),
+                                };
+                                movie.watch_log.push(entry);
+                            }
+                            db_mut.save_to_file();
+                            drop(db_mut);
+                            status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
                         }
                         Err(_) => {
                             // Try flatpak version
                             match Command::new("flatpak")
-                                .args(["run", "org.videolan.VLC", &movie.file_path])
+                                .args(["run", "org.videolan.VLC", &file_path])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .spawn()
                             {
                                 Ok(_) => {
-                                    status_bar_clone.set_text(&format!("Playing: {}", movie.title));
+                                    // Auto-log to watch history
+                                    let mut db_mut = db_clone.borrow_mut();
+                                    if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                        let entry = WatchLogEntry {
+                                            date: today,
+                                            rating: None,
+                                            comments: String::from("Watched"),
+                                        };
+                                        movie.watch_log.push(entry);
+                                    }
+                                    db_mut.save_to_file();
+                                    drop(db_mut);
+                                    status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
                                 }
                                 Err(_) => {
                                     status_bar_clone.set_text("VLC not found. Please install VLC.");
@@ -1756,6 +1871,219 @@ fn build_ui(app: &Application) {
         }
     });
 
+    // Watch Log button
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    let selected_movie_id_clone = selected_movie_id.clone();
+    watch_log_button.connect_clicked(move |_| {
+        let movie_id = *selected_movie_id_clone.borrow();
+        if movie_id == 0 {
+            return;
+        }
+        
+        let db = db_clone.borrow();
+        if let Some(movie) = db.movies.get(&movie_id) {
+            let movie_title = movie.title.clone();
+            let movie_year = movie.year;
+            let watch_log = movie.watch_log.clone();
+            drop(db);
+            
+            // Create watch log dialog
+            let log_dialog = Window::builder()
+                .title(&format!("Watch Log: {} ({})", movie_title, movie_year))
+                .modal(true)
+                .transient_for(&window_clone)
+                .default_width(600)
+                .default_height(500)
+                .build();
+            
+            let dialog_box = Box::new(Orientation::Vertical, 12);
+            dialog_box.set_margin_start(20);
+            dialog_box.set_margin_end(20);
+            dialog_box.set_margin_top(20);
+            dialog_box.set_margin_bottom(20);
+            
+            let title_label = Label::new(Some(&format!("Watch History for {} ({})", movie_title, movie_year)));
+            title_label.set_markup(&format!("<b>Watch History for {} ({})</b>", escape_markup(&movie_title), movie_year));
+            dialog_box.append(&title_label);
+            
+            // Scrolled window for watch log entries
+            let scroll = ScrolledWindow::new();
+            scroll.set_vexpand(true);
+            scroll.set_min_content_height(250);
+            
+            let entries_box = Box::new(Orientation::Vertical, 12);
+            scroll.set_child(Some(&entries_box));
+            
+            // Display existing watch log entries
+            if watch_log.is_empty() {
+                let no_entries = Label::new(Some("No watch history yet. Add your first entry below!"));
+                no_entries.set_opacity(0.6);
+                entries_box.append(&no_entries);
+            } else {
+                for entry in &watch_log {
+                    let entry_frame = Frame::new(None);
+                    let entry_box = Box::new(Orientation::Vertical, 6);
+                    entry_box.set_margin_start(12);
+                    entry_box.set_margin_end(12);
+                    entry_box.set_margin_top(8);
+                    entry_box.set_margin_bottom(8);
+                    
+                    let date_label = Label::new(Some(&format!("📅 {}", entry.date)));
+                    date_label.set_xalign(0.0);
+                    date_label.set_markup(&format!("<b>📅 {}</b>", entry.date));
+                    entry_box.append(&date_label);
+                    
+                    if let Some(rating) = entry.rating {
+                        let rating_label = Label::new(Some(&format!("⭐ Personal Rating: {:.1}/10", rating)));
+                        rating_label.set_xalign(0.0);
+                        entry_box.append(&rating_label);
+                    }
+                    
+                    if !entry.comments.is_empty() {
+                        let comments_label = Label::new(Some(&entry.comments));
+                        comments_label.set_xalign(0.0);
+                        comments_label.set_wrap(true);
+                        comments_label.set_margin_top(6);
+                        entry_box.append(&comments_label);
+                    }
+                    
+                    entry_frame.set_child(Some(&entry_box));
+                    entries_box.append(&entry_frame);
+                }
+            }
+            
+            dialog_box.append(&scroll);
+            
+            // Add new entry section
+            let add_section = Frame::new(Some("Add New Watch Entry"));
+            let add_box = Box::new(Orientation::Vertical, 12);
+            add_box.set_margin_start(12);
+            add_box.set_margin_end(12);
+            add_box.set_margin_top(12);
+            add_box.set_margin_bottom(12);
+            
+            // Date entry (auto-filled with today)
+            let date_box = Box::new(Orientation::Horizontal, 8);
+            let date_label = Label::new(Some("Date:"));
+            let date_entry = Entry::new();
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            date_entry.set_text(&today);
+            date_entry.set_placeholder_text(Some("YYYY-MM-DD"));
+            date_box.append(&date_label);
+            date_box.append(&date_entry);
+            add_box.append(&date_box);
+            
+            // Rating entry (optional)
+            let rating_box = Box::new(Orientation::Horizontal, 8);
+            let rating_label = Label::new(Some("Your Rating (0-10):"));
+            let rating_entry = Entry::new();
+            rating_entry.set_placeholder_text(Some("Optional - e.g., 8.5"));
+            rating_box.append(&rating_label);
+            rating_box.append(&rating_entry);
+            add_box.append(&rating_box);
+            
+            // Comments (multi-line)
+            let comments_label = Label::new(Some("Comments:"));
+            comments_label.set_xalign(0.0);
+            add_box.append(&comments_label);
+            
+            let comments_scroll = ScrolledWindow::new();
+            comments_scroll.set_min_content_height(100);
+            let comments_text = gtk::TextView::new();
+            comments_text.set_wrap_mode(gtk::WrapMode::Word);
+            comments_scroll.set_child(Some(&comments_text));
+            add_box.append(&comments_scroll);
+            
+            // Add button
+            let button_box = Box::new(Orientation::Horizontal, 8);
+            let add_button = Button::with_label("Add Entry");
+            let close_button = Button::with_label("Close");
+            button_box.append(&add_button);
+            button_box.append(&close_button);
+            add_box.append(&button_box);
+            
+            add_section.set_child(Some(&add_box));
+            dialog_box.append(&add_section);
+            
+            log_dialog.set_child(Some(&dialog_box));
+            
+            // Add button handler
+            let db_clone2 = db_clone.clone();
+            let log_dialog_clone = log_dialog.clone();
+            let entries_box_clone = entries_box.clone();
+            add_button.connect_clicked(move |_| {
+                let date = date_entry.text().to_string();
+                let rating_text = rating_entry.text().to_string();
+                let rating = if rating_text.is_empty() {
+                    None
+                } else {
+                    rating_text.parse::<f32>().ok()
+                };
+                
+                let buffer = comments_text.buffer();
+                let comments = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+                
+                // Create new entry
+                let entry = WatchLogEntry {
+                    date,
+                    rating,
+                    comments,
+                };
+                
+                // Add to movie
+                let mut db = db_clone2.borrow_mut();
+                if let Some(movie) = db.movies.get_mut(&movie_id) {
+                    movie.watch_log.push(entry.clone());
+                    db.save_to_file();
+                }
+                drop(db);
+                
+                // Add to display
+                let entry_frame = Frame::new(None);
+                let entry_box = Box::new(Orientation::Vertical, 6);
+                entry_box.set_margin_start(12);
+                entry_box.set_margin_end(12);
+                entry_box.set_margin_top(8);
+                entry_box.set_margin_bottom(8);
+                
+                let date_label = Label::new(Some(&format!("📅 {}", entry.date)));
+                date_label.set_xalign(0.0);
+                date_label.set_markup(&format!("<b>📅 {}</b>", entry.date));
+                entry_box.append(&date_label);
+                
+                if let Some(rating) = entry.rating {
+                    let rating_label = Label::new(Some(&format!("⭐ Personal Rating: {:.1}/10", rating)));
+                    rating_label.set_xalign(0.0);
+                    entry_box.append(&rating_label);
+                }
+                
+                if !entry.comments.is_empty() {
+                    let comments_label = Label::new(Some(&entry.comments));
+                    comments_label.set_xalign(0.0);
+                    comments_label.set_wrap(true);
+                    comments_label.set_margin_top(6);
+                    entry_box.append(&comments_label);
+                }
+                
+                entry_frame.set_child(Some(&entry_box));
+                entries_box_clone.append(&entry_frame);
+                
+                // Clear inputs
+                date_entry.set_text(&chrono::Local::now().format("%Y-%m-%d").to_string());
+                rating_entry.set_text("");
+                buffer.set_text("");
+            });
+            
+            // Close button handler
+            close_button.connect_clicked(move |_| {
+                log_dialog_clone.close();
+            });
+            
+            log_dialog.present();
+        }
+    });
+
     // Scan directory
     let window_clone = window.clone();
     let db_clone = db.clone();
@@ -1782,8 +2110,9 @@ fn build_ui(app: &Application) {
                     // Create async channel
                     let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
                     
-                    // Get API key and existing paths before spawning thread (Rc can't be sent)
+                    // Get API key, posters_dir, and existing paths before spawning thread (Rc can't be sent)
                     let api_key = db_clone3.borrow().tmdb_api_key.clone();
+                    let posters_dir = db_clone3.borrow().posters_dir.clone();
                     let existing_paths: std::collections::HashSet<String> = db_clone3.borrow()
                         .movies
                         .values()
@@ -1833,11 +2162,12 @@ fn build_ui(app: &Application) {
                                         let file_path = file_path_str.clone();
                                         let client = client.clone();
                                         let sender = sender.clone();
+                                        let posters_dir = posters_dir.clone();
                                         
                                         async move {
                                             let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                             
-                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone()).await {
+                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir).await {
                                                 Some(movie) => {
                                                     let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                                 }
@@ -1858,6 +2188,7 @@ fn build_ui(app: &Application) {
                                                         tmdb_id: 0,
                                                         imdb_id: String::new(),
                                                         poster_path: String::new(),
+                                                        watch_log: Vec::new(),
                                                     };
                                                     let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
                                                 }
@@ -1919,12 +2250,14 @@ fn build_ui(app: &Application) {
     let selected_movie_id_clone = selected_movie_id.clone();
     let status_bar_clone = status_bar.clone();
     let poster_cache_clone = poster_cache.clone();
+    let posters_dir_clone = db.borrow().posters_dir.clone();
     refresh_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id > 0 {
             let db_clone2 = db_clone.clone();
             let list_box_clone2 = list_box_clone.clone();
             let status_bar_clone2 = status_bar_clone.clone();
+            let posters_dir = posters_dir_clone.clone();
             let poster_cache_clone2 = poster_cache_clone.clone();
             
             // Get the data we need before spawning thread
@@ -2001,7 +2334,7 @@ fn build_ui(app: &Application) {
                                         .unwrap_or_default();
                                     
                                     let poster_path = if !poster_url.is_empty() {
-                                        download_poster(&poster_url, tmdb_movie_id).unwrap_or_default()
+                                        download_poster(&poster_url, tmdb_movie_id, &posters_dir).unwrap_or_default()
                                     } else {
                                         String::new()
                                     };
@@ -2038,6 +2371,7 @@ fn build_ui(app: &Application) {
                                         tmdb_id: tmdb_movie_id,
                                         imdb_id,
                                         poster_path,
+        watch_log: Vec::new(),
                                     };
                                     
                                     let _ = sender.send_blocking(Some((movie_id, movie)));
@@ -2081,6 +2415,7 @@ fn build_ui(app: &Application) {
     let grid_flow_clone = grid_flow.clone();
     let status_bar_clone = status_bar.clone();
     let poster_cache_clone = poster_cache.clone();
+    let posters_dir_clone = db.borrow().posters_dir.clone();
     let is_grid_view_clone = is_grid_view.clone();
     refresh_all_button.connect_clicked(move |_| {
         // Confirm with user
@@ -2098,6 +2433,7 @@ fn build_ui(app: &Application) {
         let status_bar_clone2 = status_bar_clone.clone();
         let poster_cache_clone2 = poster_cache_clone.clone();
         let is_grid_view_clone2 = is_grid_view_clone.clone();
+        let posters_dir = posters_dir_clone.clone();
         
         dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
             if let Ok(1) = response {
@@ -2184,7 +2520,7 @@ fn build_ui(app: &Application) {
                                                 .unwrap_or_default();
                                             
                                             let poster_path = if !poster_url.is_empty() {
-                                                download_poster(&poster_url, tmdb_movie_id).unwrap_or_default()
+                                                download_poster(&poster_url, tmdb_movie_id, &posters_dir).unwrap_or_default()
                                             } else {
                                                 String::new()
                                             };
@@ -2221,6 +2557,7 @@ fn build_ui(app: &Application) {
                                                 tmdb_id: tmdb_movie_id,
                                                 imdb_id,
                                                 poster_path,
+        watch_log: Vec::new(),
                                             };
                                             
                                             let _ = sender.send_blocking((String::new(), Some((*movie_id, movie))));
@@ -2519,6 +2856,7 @@ fn build_ui(app: &Application) {
     let status_bar_clone = status_bar.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
     let poster_cache_clone_select = poster_cache.clone();
+    let posters_dir_clone = db.borrow().posters_dir.clone();
     select_version_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -2698,6 +3036,7 @@ fn build_ui(app: &Application) {
             let db_clone_for_cache = db_clone2.clone();
             let cache_key_for_save = cache_key.clone();
             let poster_cache_clone_select2 = poster_cache_clone_select.clone();
+            let posters_dir = posters_dir_clone.clone();
             glib::spawn_future_local(async move {
                 if let Ok(results) = receiver.recv().await {
                     // Cache the results if not from cache
@@ -2770,8 +3109,9 @@ fn build_ui(app: &Application) {
                                 let status_bar_clone3 = status_bar_clone2.clone();
                                 let file_path_clone = file_path.clone();
                                 
-                                // Extract API key before spawning thread (Rc can't be sent)
+                                // Extract API key and posters_dir before spawning thread (Rc can't be sent)
                                 let api_key = db_clone3.borrow().tmdb_api_key.clone();
+                                let posters_dir = posters_dir.clone();
                                 
                                 let (sender2, receiver2) = async_channel::unbounded::<Option<(u32, Movie)>>();
                                 
@@ -2824,7 +3164,7 @@ fn build_ui(app: &Application) {
                                                 .unwrap_or_default();
                                             
                                             let poster_path = if !poster_url.is_empty() {
-                                                download_poster(&poster_url, tmdb_id).unwrap_or_default()
+                                                download_poster(&poster_url, tmdb_id, &posters_dir).unwrap_or_default()
                                             } else {
                                                 String::new()
                                             };
@@ -2861,6 +3201,7 @@ fn build_ui(app: &Application) {
                                                 tmdb_id,
                                                 imdb_id,
                                                 poster_path,
+        watch_log: Vec::new(),
                                             };
                                             
                                             let _ = sender2.send_blocking(Some((movie_id, new_movie)));
@@ -2906,6 +3247,7 @@ fn build_ui(app: &Application) {
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
     let poster_cache_clone_add = poster_cache.clone();
+    let posters_dir_clone = db.borrow().posters_dir.clone();
     add_button.connect_clicked(move |_| {
         let dialog = Window::builder()
             .title("Add New Movie")
@@ -2989,6 +3331,7 @@ fn build_ui(app: &Application) {
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
         let poster_cache_clone_add2 = poster_cache_clone_add.clone();
+        let posters_dir = posters_dir_clone.clone();
         search_btn.connect_clicked(move |_| {
             let search_title = title_entry.text().to_string();
             let selected_file_path = file_entry.text().to_string();
@@ -3118,6 +3461,7 @@ fn build_ui(app: &Application) {
                 let db_clone_for_cache = db_clone3.clone();
                 let search_title_for_cache2 = search_title_for_ui.clone();
                 let poster_cache_clone_add3 = poster_cache_clone_add2.clone();
+                let posters_dir = posters_dir.clone();
                 glib::spawn_future_local(async move {
                     if let Ok(results) = receiver.recv().await {
                         // Cache the results if not from cache
@@ -3191,6 +3535,7 @@ fn build_ui(app: &Application) {
                                     let status_bar_clone4 = status_bar_clone3.clone();
                                     
                                     let api_key = db_clone4.borrow().tmdb_api_key.clone();
+                                    let posters_dir = posters_dir.clone();
                                     let (sender2, receiver2) = async_channel::unbounded::<Option<(String, Movie)>>();
                                     
                                     let file_path_clone = file_path_final.clone();
@@ -3242,7 +3587,7 @@ fn build_ui(app: &Application) {
                                                     .unwrap_or_default();
                                                 
                                                 let poster_path = if !poster_url.is_empty() {
-                                                    download_poster(&poster_url, tmdb_id).unwrap_or_default()
+                                                    download_poster(&poster_url, tmdb_id, &posters_dir).unwrap_or_default()
                                                 } else {
                                                     String::new()
                                                 };
@@ -3279,6 +3624,7 @@ fn build_ui(app: &Application) {
                                                     tmdb_id,
                                                     imdb_id,
                                                     poster_path,
+        watch_log: Vec::new(),
                                                 };
                                                 
                                                 let _ = sender2.send_blocking(Some((details.title, movie)));
