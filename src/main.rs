@@ -200,6 +200,8 @@ struct MovieDatabase {
     tmdb_cache: HashMap<String, CachedTMDBSearch>,  // search_query -> cached results
     #[serde(skip)]  // Don't serialize pixbufs (can't serialize)
     poster_cache: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> cached pixbuf
+    #[serde(skip)]  // Cache for search/filter/sort results
+    result_cache: RefCell<HashMap<String, Vec<Movie>>>,  // cache_key -> filtered/sorted movies
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +377,7 @@ impl MovieDatabase {
             tmdb_api_key: api_key.to_string(),
             tmdb_cache: HashMap::new(),
             poster_cache: Rc::new(RefCell::new(HashMap::new())),
+            result_cache: RefCell::new(HashMap::new()),
         };
         db.load_from_file();
         db
@@ -384,6 +387,7 @@ impl MovieDatabase {
         movie.id = self.next_id;
         self.movies.insert(self.next_id, movie);
         self.next_id += 1;
+        self.invalidate_result_cache();
         self.save_to_file();
     }
 
@@ -410,6 +414,7 @@ impl MovieDatabase {
 
     fn delete_movie(&mut self, id: u32) -> bool {
         if self.movies.remove(&id).is_some() {
+            self.invalidate_result_cache();
             self.save_to_file();
             true
         } else {
@@ -521,6 +526,19 @@ impl MovieDatabase {
         // Save to persist cache
         self.save_to_file();
     }
+    
+    // Result cache methods for search/filter/sort
+    fn get_cached_results(&self, cache_key: &str) -> Option<Vec<Movie>> {
+        self.result_cache.borrow().get(cache_key).cloned()
+    }
+    
+    fn cache_results(&self, cache_key: String, results: Vec<Movie>) {
+        self.result_cache.borrow_mut().insert(cache_key, results);
+    }
+    
+    fn invalidate_result_cache(&self) {
+        self.result_cache.borrow_mut().clear();
+    }
 }
 
 fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::ListBoxRow {
@@ -543,25 +561,28 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     poster_box.set_size_request(60, 90);
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        // Check cache first
-        let mut cache = poster_cache.borrow_mut();
+        // Safe cache access - get or insert in one operation
+        let pixbuf_opt = {
+            let cache = poster_cache.borrow();
+            cache.get(&movie.id).cloned()
+        };
         
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Use cached pixbuf and scale for display (FAST!)
-            if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
-            }
+        if let Some(pixbuf) = pixbuf_opt {
+            // Use cached THUMBNAIL (already at display size!)
+            let picture = Picture::for_pixbuf(&pixbuf);
+            picture.set_can_shrink(true);
+            poster_box.append(&picture);
         } else {
-            // Load FULL RESOLUTION from disk and cache it
+            // Load from disk and scale DOWN immediately, cache ONLY the thumbnail
             if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                // Cache the FULL resolution
-                cache.insert(movie.id, pixbuf.clone());
-                
-                // Scale for display
-                if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let picture = Picture::for_pixbuf(&scaled);
+                // Scale to display size IMMEDIATELY (don't cache full res!)
+                if let Some(thumbnail) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    // Cache the THUMBNAIL only (saves massive memory)
+                    if let Ok(mut cache) = poster_cache.try_borrow_mut() {
+                        cache.insert(movie.id, thumbnail.clone());
+                    }
+                    
+                    let picture = Picture::for_pixbuf(&thumbnail);
                     picture.set_can_shrink(true);
                     poster_box.append(&picture);
                 }
@@ -629,21 +650,33 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
     poster_box.set_size_request(160, 240);
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        let mut cache = poster_cache.borrow_mut();
+        // Check if we have a cached thumbnail (safe access)
+        let has_cached = {
+            let cache = poster_cache.borrow();
+            cache.get(&movie.id).is_some()
+        };
         
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Scale cached full-res for grid view (larger)
-            if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
+        if has_cached {
+            // We have SOME cached version - but it might be 60x90 for list view
+            // Just load from disk at the size we need (fast enough for grid view)
+            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
+                if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    let picture = Picture::for_pixbuf(&scaled);
+                    picture.set_can_shrink(true);
+                    poster_box.append(&picture);
+                }
             }
         } else {
-            // Load FULL RESOLUTION and cache it
+            // No cache at all - load and cache at list view size (60x90) for later
             if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                cache.insert(movie.id, pixbuf.clone());
+                // Cache thumbnail for list view
+                if let Some(thumbnail) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    if let Ok(mut cache) = poster_cache.try_borrow_mut() {
+                        cache.insert(movie.id, thumbnail);
+                    }
+                }
                 
-                // Scale for display
+                // Display at grid size
                 if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
                     let picture = Picture::for_pixbuf(&scaled);
                     picture.set_can_shrink(true);
@@ -1257,48 +1290,91 @@ fn build_ui(app: &Application) {
             grid_flow.remove(&child);
         }
 
-        let mut results = if search_query.is_empty() {
-            db.borrow().search_by_genre(genre_filter)
-        } else {
-            db.borrow().search_by_title(search_query)
-        };
+        // Create cache key from current filters
+        let cache_key = format!("{}|{}|{}", search_query, genre_filter, sort_by);
         
-        // Apply sorting
-        match sort_by {
-            "Title (A-Z)" => {
-                results.sort_by(|a, b| a.title.cmp(&b.title));
+        // Check cache first - do all database access in one scope
+        let results = {
+            let db_ref = db.borrow();
+            if let Some(cached) = db_ref.get_cached_results(&cache_key) {
+                cached
+            } else {
+                // Need to compute - drop the borrow first
+                drop(db_ref);
+                
+                // Cache miss - compute results
+                let mut results = if search_query.is_empty() {
+                    db.borrow().search_by_genre(genre_filter)
+                } else {
+                    db.borrow().search_by_title(search_query)
+                };
+                
+                // Apply sorting
+                match sort_by {
+                    "Title (A-Z)" => {
+                        results.sort_by(|a, b| a.title.cmp(&b.title));
+                    }
+                    "Year (Newest)" => {
+                        results.sort_by(|a, b| b.year.cmp(&a.year));
+                    }
+                    "Year (Oldest)" => {
+                        results.sort_by(|a, b| a.year.cmp(&b.year));
+                    }
+                    "Rating (High-Low)" => {
+                        results.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                    "Rating (Low-High)" => {
+                        results.sort_by(|a, b| a.rating.partial_cmp(&b.rating).unwrap_or(std::cmp::Ordering::Equal));
+                    }
+                    "Date Added (Newest)" => {
+                        results.sort_by(|a, b| b.id.cmp(&a.id));
+                    }
+                    "Date Added (Oldest)" => {
+                        results.sort_by(|a, b| a.id.cmp(&b.id));
+                    }
+                    _ => {}
+                }
+                
+                // Cache the results
+                db.borrow().cache_results(cache_key, results.clone());
+                results
             }
-            "Year (Newest)" => {
-                results.sort_by(|a, b| b.year.cmp(&a.year));
-            }
-            "Year (Oldest)" => {
-                results.sort_by(|a, b| a.year.cmp(&b.year));
-            }
-            "Rating (High-Low)" => {
-                results.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            "Rating (Low-High)" => {
-                results.sort_by(|a, b| a.rating.partial_cmp(&b.rating).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            "Date Added (Newest)" => {
-                results.sort_by(|a, b| b.id.cmp(&a.id));
-            }
-            "Date Added (Oldest)" => {
-                results.sort_by(|a, b| a.id.cmp(&b.id));
-            }
-            _ => {}
-        }
+        };
 
-        // Populate the active view
+        // Populate the active view in batches to prevent UI freezing
         if is_grid_view {
-            for movie in &results {
-                let item = create_movie_grid_item(movie, poster_cache);
-                grid_flow.append(&item);
+            let batch_size = 50; // Add 50 items at a time
+            let total = results.len();
+            
+            for (idx, chunk) in results.chunks(batch_size).enumerate() {
+                for movie in chunk {
+                    let item = create_movie_grid_item(movie, poster_cache);
+                    grid_flow.append(&item);
+                }
+                
+                // Force UI update between batches for large collections
+                if idx < total / batch_size {
+                    while gtk::glib::MainContext::default().pending() {
+                        gtk::glib::MainContext::default().iteration(false);
+                    }
+                }
             }
         } else {
-            for movie in &results {
-                let row = create_movie_row(movie, poster_cache);
-                list_box.append(&row);
+            let batch_size = 50; // Add 50 items at a time
+            let total = results.len();
+            
+            for (idx, chunk) in results.chunks(batch_size).enumerate() {
+                for movie in chunk {
+                    let row = create_movie_row(movie, poster_cache);
+                    list_box.append(&row);
+                }
+                
+                // Force UI update between batches for large collections
+                if idx < total / batch_size {
+                    while gtk::glib::MainContext::default().pending() {
+                        gtk::glib::MainContext::default().iteration(false);
+                    }
+                }
             }
         }
     }
@@ -1547,6 +1623,7 @@ fn build_ui(app: &Application) {
                                 };
                                 movie.watch_log.push(entry);
                             }
+                            db_mut.invalidate_result_cache();
                             db_mut.save_to_file();
                             drop(db_mut);
                             status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
@@ -1571,6 +1648,7 @@ fn build_ui(app: &Application) {
                                         };
                                         movie.watch_log.push(entry);
                                     }
+                                    db_mut.invalidate_result_cache();
                                     db_mut.save_to_file();
                                     drop(db_mut);
                                     status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
@@ -2035,6 +2113,7 @@ fn build_ui(app: &Application) {
                 let mut db = db_clone2.borrow_mut();
                 if let Some(movie) = db.movies.get_mut(&movie_id) {
                     movie.watch_log.push(entry.clone());
+                    db.invalidate_result_cache();
                     db.save_to_file();
                 }
                 drop(db);
@@ -2853,10 +2932,15 @@ fn build_ui(app: &Application) {
     let window_clone = window.clone();
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
+    let grid_flow_clone = grid_flow.clone();
     let status_bar_clone = status_bar.clone();
     let selected_movie_id_clone = selected_movie_id.clone();
     let poster_cache_clone_select = poster_cache.clone();
     let posters_dir_clone = db.borrow().posters_dir.clone();
+    let sort_dropdown_clone = sort_dropdown.clone();
+    let search_entry_clone = search_entry.clone();
+    let genre_dropdown_clone = genre_dropdown.clone();
+    let is_grid_view_clone = is_grid_view.clone();
     select_version_button.connect_clicked(move |_| {
         let movie_id = *selected_movie_id_clone.borrow();
         if movie_id == 0 {
@@ -3037,6 +3121,11 @@ fn build_ui(app: &Application) {
             let cache_key_for_save = cache_key.clone();
             let poster_cache_clone_select2 = poster_cache_clone_select.clone();
             let posters_dir = posters_dir_clone.clone();
+            let sort_dropdown_clone2 = sort_dropdown_clone.clone();
+            let search_entry_clone2 = search_entry_clone.clone();
+            let genre_dropdown_clone2 = genre_dropdown_clone.clone();
+            let grid_flow_clone2 = grid_flow_clone.clone();
+            let is_grid_view_clone2 = is_grid_view_clone.clone();
             glib::spawn_future_local(async move {
                 if let Ok(results) = receiver.recv().await {
                     // Cache the results if not from cache
@@ -3212,21 +3301,58 @@ fn build_ui(app: &Application) {
                                 });
                                 
                                 let poster_cache_clone_select3 = poster_cache_clone_select2.clone();
+                                let sort_dropdown = sort_dropdown_clone2.clone();
+                                let search_entry = search_entry_clone2.clone();
+                                let genre_dropdown = genre_dropdown_clone2.clone();
+                                let grid_flow = grid_flow_clone2.clone();
+                                let is_grid_view = is_grid_view_clone2.clone();
                                 glib::spawn_future_local(async move {
                                     if let Ok(Some((old_id, new_movie))) = receiver2.recv().await {
                                         db_clone3.borrow_mut().delete_movie(old_id);
                                         db_clone3.borrow_mut().add_movie(new_movie);
                                         
-                                        // Refresh list
-                                        while let Some(child) = list_box_clone3.first_child() {
-                                            list_box_clone3.remove(&child);
-                                        }
+                                        // Set sort to "Year (Newest)" - index 2
+                                        sort_dropdown.set_selected(2);
                                         
-                                        let movies = db_clone3.borrow().list_all();
-                                        for movie in &movies {
-                                            let row = create_movie_row(movie, &poster_cache_clone_select3);
-                                            list_box_clone3.append(&row);
-                                        }
+                                        // Refresh list with proper sorting
+                                        let search_query = search_entry.text().to_string();
+                                        let genre_idx = genre_dropdown.selected();
+                                        let genre_filter = if genre_idx == 0 {
+                                            ""
+                                        } else {
+                                            match genre_idx {
+                                                1 => "Action",
+                                                2 => "Adventure",
+                                                3 => "Animation",
+                                                4 => "Comedy",
+                                                5 => "Crime",
+                                                6 => "Documentary",
+                                                7 => "Drama",
+                                                8 => "Family",
+                                                9 => "Fantasy",
+                                                10 => "History",
+                                                11 => "Horror",
+                                                12 => "Music",
+                                                13 => "Mystery",
+                                                14 => "Romance",
+                                                15 => "Science Fiction",
+                                                16 => "Thriller",
+                                                17 => "War",
+                                                18 => "Western",
+                                                _ => "",
+                                            }
+                                        };
+                                        
+                                        refresh_movie_list(
+                                            &list_box_clone3,
+                                            &grid_flow,
+                                            *is_grid_view.borrow(),
+                                            &db_clone3,
+                                            &search_query,
+                                            genre_filter,
+                                            "Year (Newest)",
+                                            &poster_cache_clone_select3,
+                                        );
                                         
                                         status_bar_clone3.set_text("Movie version updated successfully!");
                                     } else {
