@@ -208,6 +208,8 @@ struct MovieDatabase {
     tmdb_cache: HashMap<String, CachedTMDBSearch>,  // search_query -> cached results
     #[serde(skip)]  // Don't serialize pixbufs (can't serialize)
     poster_cache: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> cached pixbuf
+    #[serde(skip)]  // Cache for search/filter/sort results
+    result_cache: RefCell<HashMap<String, Vec<Movie>>>,  // cache_key -> filtered/sorted movies
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +404,7 @@ impl MovieDatabase {
             tmdb_api_key: api_key.to_string(),
             tmdb_cache: HashMap::new(),
             poster_cache: Rc::new(RefCell::new(HashMap::new())),
+            result_cache: RefCell::new(HashMap::new()),
         };
         db.load_from_file();
         db
@@ -411,6 +414,7 @@ impl MovieDatabase {
         movie.id = self.next_id;
         self.movies.insert(self.next_id, movie);
         self.next_id += 1;
+        self.invalidate_result_cache();
         self.save_to_file();
     }
 
@@ -437,6 +441,7 @@ impl MovieDatabase {
 
     fn delete_movie(&mut self, id: u32) -> bool {
         if self.movies.remove(&id).is_some() {
+            self.invalidate_result_cache();
             self.save_to_file();
             true
         } else {
@@ -548,6 +553,19 @@ impl MovieDatabase {
         // Save to persist cache
         self.save_to_file();
     }
+    
+    // Result cache methods for search/filter/sort
+    fn get_cached_results(&self, cache_key: &str) -> Option<Vec<Movie>> {
+        self.result_cache.borrow().get(cache_key).cloned()
+    }
+    
+    fn cache_results(&self, cache_key: String, results: Vec<Movie>) {
+        self.result_cache.borrow_mut().insert(cache_key, results);
+    }
+    
+    fn invalidate_result_cache(&self) {
+        self.result_cache.borrow_mut().clear();
+    }
 }
 
 fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>) -> gtk::ListBoxRow {
@@ -637,6 +655,110 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     
     hbox.append(&vbox);
     row.set_child(Some(&hbox));
+    
+    row
+}
+
+fn create_movie_row_with_context(
+    movie: &Movie,
+    poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
+    db: &Rc<RefCell<MovieDatabase>>,
+) -> gtk::ListBoxRow {
+    let row = create_movie_row(movie, poster_cache);
+    
+    // Add right-click context menu
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // Right mouse button
+    
+    let movie_id = movie.id;
+    let file_path = movie.file_path.clone();
+    let movie_title = movie.title.clone();
+    let db_clone = db.clone();
+    let row_clone = row.clone();
+    
+    gesture.connect_released(move |_, _, x, y| {
+        let menu_model = gtk::gio::Menu::new();
+        menu_model.append(Some("▶️ Play in VLC"), Some("movie.play"));
+        menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
+        
+        let menu = gtk::PopoverMenu::from_model(Some(&menu_model));
+        menu.set_parent(&row_clone);
+        menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        
+        // Create action group
+        let actions = gtk::gio::SimpleActionGroup::new();
+        
+        // Play action
+        let play_action = gtk::gio::SimpleAction::new("play", None);
+        let file_path_clone = file_path.clone();
+        let movie_title_clone = movie_title.clone();
+        let menu_clone = menu.clone();
+        play_action.connect_activate(move |_, _| {
+            if !file_path_clone.is_empty() && Path::new(&file_path_clone).exists() {
+                // Try regular VLC first
+                match Command::new("vlc")
+                    .arg(&file_path_clone)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => {
+                        eprintln!("Playing: {}", movie_title_clone);
+                    }
+                    Err(_) => {
+                        // Try flatpak VLC
+                        match Command::new("flatpak")
+                            .args(["run", "org.videolan.VLC", &file_path_clone])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        {
+                            Ok(_) => {
+                                eprintln!("Playing: {}", movie_title_clone);
+                            }
+                            Err(_) => {
+                                eprintln!("VLC not found");
+                            }
+                        }
+                    }
+                }
+            }
+            menu_clone.popdown();
+        });
+        
+        // Delete action
+        let delete_action = gtk::gio::SimpleAction::new("delete", None);
+        let db_clone3 = db_clone.clone();
+        let menu_clone2 = menu.clone();
+        let movie_title_clone2 = movie_title.clone();
+        let row_clone2 = row_clone.clone();
+        delete_action.connect_activate(move |_, _| {
+            // Delete the movie from database
+            let mut db_mut = db_clone3.borrow_mut();
+            if db_mut.delete_movie(movie_id) {
+                eprintln!("Deleted movie metadata: {}", movie_title_clone2);
+                drop(db_mut);
+                
+                // Remove the row from UI
+                if let Some(parent) = row_clone2.parent() {
+                    if let Some(list_box) = parent.downcast_ref::<ListBox>() {
+                        list_box.remove(&row_clone2);
+                    }
+                }
+            } else {
+                eprintln!("Failed to delete movie");
+            }
+            menu_clone2.popdown();
+        });
+        
+        actions.add_action(&play_action);
+        actions.add_action(&delete_action);
+        menu.insert_action_group("movie", Some(&actions));
+        
+        menu.popup();
+    });
+    
+    row.add_controller(gesture);
     
     row
 }
@@ -1080,13 +1202,21 @@ fn build_ui(app: &Application) {
         }
     });
 
-    // Populate initial list
+    // Show window first for fast startup
+    window.present();
+    
+    // Defer initial list population until after window is visible (prevents slow startup)
     let db_clone = db.clone();
-    let movies = db_clone.borrow().list_all();
-    for movie in &movies {
-        let row = create_movie_row(movie, &poster_cache);
-        list_box.append(&row);
-    }
+    let db_clone2 = db.clone();
+    let list_box_clone = list_box.clone();
+    let poster_cache_clone = poster_cache.clone();
+    glib::idle_add_local_once(move || {
+        let movies = db_clone.borrow().list_all();
+        for movie in &movies {
+            let row = create_movie_row_with_context(movie, &poster_cache_clone, &db_clone2);
+            list_box_clone.append(&row);
+        }
+    });
 
     // Auto-scan on startup if enabled
     let config = load_config().unwrap_or_default();
@@ -1286,37 +1416,50 @@ fn build_ui(app: &Application) {
             grid_flow.remove(&child);
         }
 
-        let mut results = if search_query.is_empty() {
-            db.borrow().search_by_genre(genre_filter)
-        } else {
-            db.borrow().search_by_title(search_query)
-        };
+        // Create cache key from current filters
+        let cache_key = format!("{}|{}|{}", search_query, genre_filter, sort_by);
         
-        // Apply sorting
-        match sort_by {
-            "Title (A-Z)" => {
-                results.sort_by(|a, b| a.title.cmp(&b.title));
+        // Check cache first
+        let results = if let Some(cached) = db.borrow().get_cached_results(&cache_key) {
+            cached
+        } else {
+            // Cache miss - compute results
+            let mut results = if search_query.is_empty() {
+                db.borrow().search_by_genre(genre_filter)
+            } else {
+                db.borrow().search_by_title(search_query)
+            };
+            
+            // Apply sorting
+            match sort_by {
+                "Title (A-Z)" => {
+                    results.sort_by(|a, b| a.title.cmp(&b.title));
+                }
+                "Year (Newest)" => {
+                    results.sort_by(|a, b| b.year.cmp(&a.year));
+                }
+                "Year (Oldest)" => {
+                    results.sort_by(|a, b| a.year.cmp(&b.year));
+                }
+                "Rating (High-Low)" => {
+                    results.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
+                }
+                "Rating (Low-High)" => {
+                    results.sort_by(|a, b| a.rating.partial_cmp(&b.rating).unwrap_or(std::cmp::Ordering::Equal));
+                }
+                "Date Added (Newest)" => {
+                    results.sort_by(|a, b| b.id.cmp(&a.id));
+                }
+                "Date Added (Oldest)" => {
+                    results.sort_by(|a, b| a.id.cmp(&b.id));
+                }
+                _ => {}
             }
-            "Year (Newest)" => {
-                results.sort_by(|a, b| b.year.cmp(&a.year));
-            }
-            "Year (Oldest)" => {
-                results.sort_by(|a, b| a.year.cmp(&b.year));
-            }
-            "Rating (High-Low)" => {
-                results.sort_by(|a, b| b.rating.partial_cmp(&a.rating).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            "Rating (Low-High)" => {
-                results.sort_by(|a, b| a.rating.partial_cmp(&b.rating).unwrap_or(std::cmp::Ordering::Equal));
-            }
-            "Date Added (Newest)" => {
-                results.sort_by(|a, b| b.id.cmp(&a.id));
-            }
-            "Date Added (Oldest)" => {
-                results.sort_by(|a, b| a.id.cmp(&b.id));
-            }
-            _ => {}
-        }
+            
+            // Cache the results
+            db.borrow().cache_results(cache_key, results.clone());
+            results
+        };
 
         // Populate the active view
         if is_grid_view {
@@ -1326,7 +1469,7 @@ fn build_ui(app: &Application) {
             }
         } else {
             for movie in &results {
-                let row = create_movie_row(movie, poster_cache);
+                let row = create_movie_row_with_context(movie, poster_cache, db);
                 list_box.append(&row);
             }
         }
@@ -4087,8 +4230,6 @@ fn build_ui(app: &Application) {
         stats_dialog.set_child(Some(&scroll));
         stats_dialog.present();
     });
-
-    window.present();
 }
 
 fn main() {
