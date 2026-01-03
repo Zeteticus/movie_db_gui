@@ -52,10 +52,16 @@ struct Config {
     scan_directories: Vec<String>,
     #[serde(default = "default_auto_scan")]
     auto_scan_on_startup: bool,
+    #[serde(default = "default_year_cutoff")]
+    year_cutoff: i32,
 }
 
 fn default_auto_scan() -> bool {
     true  // Enable by default
+}
+
+fn default_year_cutoff() -> i32 {
+    1966  // Default to pre-1966 movies
 }
 
 // Save config to file
@@ -133,6 +139,8 @@ struct TMDBSearchResponse {
 #[derive(Debug, Deserialize)]
 struct TMDBMovie {
     id: u32,
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,6 +258,7 @@ async fn fetch_movie_metadata_async(
     title: &str,
     file_path: String,
     posters_dir: String,
+    year_cutoff: i32,
 ) -> Option<Movie> {
     let search_url = format!(
         "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
@@ -270,7 +279,27 @@ async fn fetch_movie_metadata_async(
         return None;
     }
     
-    let movie_id = search_response.results[0].id;
+    // Prioritize movies before year_cutoff (filter by release_date)
+    let movie_id = {
+        // First try to find a movie before the cutoff year
+        let before_cutoff = search_response.results.iter().find(|movie| {
+            if let Some(ref date) = movie.release_date {
+                if let Some(year_str) = date.split('-').next() {
+                    if let Ok(year) = year_str.parse::<i32>() {
+                        return year <= year_cutoff;
+                    }
+                }
+            }
+            false
+        });
+        
+        // If found a movie before cutoff, use it. Otherwise fall back to first result
+        if let Some(movie) = before_cutoff {
+            movie.id
+        } else {
+            search_response.results[0].id
+        }
+    };
     
     let details_url = format!(
         "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
@@ -631,6 +660,135 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     
     hbox.append(&vbox);
     row.set_child(Some(&hbox));
+    
+    row
+}
+
+fn create_movie_row_with_context(
+    movie: &Movie, 
+    poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
+    db: &Rc<RefCell<MovieDatabase>>,
+) -> gtk::ListBoxRow {
+    let row = create_movie_row(movie, poster_cache);
+    
+    // Add right-click context menu
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // Right mouse button
+    
+    let movie_id = movie.id;
+    let file_path = movie.file_path.clone();
+    let movie_title = movie.title.clone();
+    let db_clone = db.clone();
+    let row_clone = row.clone();
+    
+    gesture.connect_released(move |_, _, x, y| {
+        let menu_model = gtk::gio::Menu::new();
+        menu_model.append(Some("▶️ Play in VLC"), Some("movie.play"));
+        menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
+        
+        let menu = gtk::PopoverMenu::from_model(Some(&menu_model));
+        menu.set_parent(&row_clone);
+        menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        
+        // Create action group
+        let actions = gtk::gio::SimpleActionGroup::new();
+        
+        let play_action = gtk::gio::SimpleAction::new("play", None);
+        let file_path_clone = file_path.clone();
+        let movie_title_clone = movie_title.clone();
+        let db_clone2 = db_clone.clone();
+        let menu_clone = menu.clone();
+        play_action.connect_activate(move |_, _| {
+            if !file_path_clone.is_empty() && Path::new(&file_path_clone).exists() {
+                // Launch VLC
+                match Command::new("vlc")
+                    .arg(&file_path_clone)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => {
+                        // Auto-log to watch history
+                        let mut db_mut = db_clone2.borrow_mut();
+                        if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                            let entry = WatchLogEntry {
+                                date: today,
+                                rating: None,
+                                comments: String::from("Watched"),
+                            };
+                            movie.watch_log.push(entry);
+                        }
+                        db_mut.invalidate_result_cache();
+                        db_mut.save_to_file();
+                        eprintln!("Playing: {}", movie_title_clone);
+                    }
+                    Err(_) => {
+                        // Try flatpak version
+                        match Command::new("flatpak")
+                            .args(["run", "org.videolan.VLC", &file_path_clone])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn()
+                        {
+                            Ok(_) => {
+                                let mut db_mut = db_clone2.borrow_mut();
+                                if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                    let entry = WatchLogEntry {
+                                        date: today,
+                                        rating: None,
+                                        comments: String::from("Watched"),
+                                    };
+                                    movie.watch_log.push(entry);
+                                }
+                                db_mut.invalidate_result_cache();
+                                db_mut.save_to_file();
+                                eprintln!("Playing: {}", movie_title_clone);
+                            }
+                            Err(_) => {
+                                eprintln!("VLC not found");
+                            }
+                        }
+                    }
+                }
+            }
+            menu_clone.popdown();
+        });
+        
+        // Delete action
+        let delete_action = gtk::gio::SimpleAction::new("delete", None);
+        let db_clone3 = db_clone.clone();
+        let menu_clone2 = menu.clone();
+        let movie_title_clone2 = movie_title.clone();
+        let row_clone2 = row_clone.clone();
+        delete_action.connect_activate(move |_, _| {
+            // Delete the movie from database
+            let mut db_mut = db_clone3.borrow_mut();
+            if db_mut.delete_movie(movie_id) {
+                eprintln!("Deleted movie metadata: {}", movie_title_clone2);
+                drop(db_mut);
+                
+                // Remove the row from UI
+                if let Some(parent) = row_clone2.parent() {
+                    if let Some(list_box) = parent.downcast_ref::<ListBox>() {
+                        list_box.remove(&row_clone2);
+                    }
+                }
+            } else {
+                eprintln!("Failed to delete movie");
+            }
+            menu_clone2.popdown();
+        });
+        
+        actions.add_action(&play_action);
+        actions.add_action(&delete_action);
+        menu.insert_action_group("movie", Some(&actions));
+        
+        menu.popup();
+    });
+    
+    row.add_controller(gesture);
     
     row
 }
@@ -1086,13 +1244,20 @@ fn build_ui(app: &Application) {
         }
     });
 
-    // Populate initial list
+    // Show window first for fast startup
+    window.present();
+    
+    // Defer initial list population until after window is visible (prevents slow startup)
     let db_clone = db.clone();
-    let movies = db_clone.borrow().list_all();
-    for movie in &movies {
-        let row = create_movie_row(movie, &poster_cache);
-        list_box.append(&row);
-    }
+    let list_box_clone = list_box.clone();
+    let poster_cache_clone = poster_cache.clone();
+    glib::idle_add_local_once(move || {
+        let movies = db_clone.borrow().list_all();
+        for movie in &movies {
+            let row = create_movie_row(movie, &poster_cache_clone);
+            list_box_clone.append(&row);
+        }
+    });
 
     // Auto-scan on startup if enabled
     let config = load_config().unwrap_or_default();
@@ -1119,6 +1284,7 @@ fn build_ui(app: &Application) {
         let scan_dirs = config.scan_directories.clone();
         let api_key = db_clone.borrow().tmdb_api_key.clone();
         let posters_dir = db_clone.borrow().posters_dir.clone();
+        let year_cutoff = config.year_cutoff;
         
         dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
             if let Ok(1) = response {
@@ -1130,6 +1296,7 @@ fn build_ui(app: &Application) {
                 
                 let api_key_clone = api_key.clone();
                 let scan_dirs_clone = scan_dirs.clone();
+                let year_cutoff_clone = year_cutoff;
                 
                 // Extract existing file paths before spawning thread (Rc can't be sent between threads)
                 let existing_paths: std::collections::HashSet<String> = db_clone.borrow()
@@ -1188,7 +1355,7 @@ fn build_ui(app: &Application) {
                                     async move {
                                         let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                         
-                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir.clone()).await {
+                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir.clone(), year_cutoff_clone).await {
                                             Some(movie) => {
                                                 let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                             }
@@ -1365,7 +1532,7 @@ fn build_ui(app: &Application) {
             
             for (idx, chunk) in results.chunks(batch_size).enumerate() {
                 for movie in chunk {
-                    let row = create_movie_row(movie, poster_cache);
+                    let row = create_movie_row_with_context(movie, poster_cache, db);
                     list_box.append(&row);
                 }
                 
@@ -2189,9 +2356,10 @@ fn build_ui(app: &Application) {
                     // Create async channel
                     let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
                     
-                    // Get API key, posters_dir, and existing paths before spawning thread (Rc can't be sent)
+                    // Get API key, posters_dir, year_cutoff, and existing paths before spawning thread (Rc can't be sent)
                     let api_key = db_clone3.borrow().tmdb_api_key.clone();
                     let posters_dir = db_clone3.borrow().posters_dir.clone();
+                    let year_cutoff = load_config().map(|c| c.year_cutoff).unwrap_or(1966);
                     let existing_paths: std::collections::HashSet<String> = db_clone3.borrow()
                         .movies
                         .values()
@@ -2246,7 +2414,7 @@ fn build_ui(app: &Application) {
                                         async move {
                                             let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                             
-                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir).await {
+                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir, year_cutoff).await {
                                                 Some(movie) => {
                                                     let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                                 }
@@ -2527,6 +2695,7 @@ fn build_ui(app: &Application) {
                 
                 let total_count = movies.len();
                 let api_key = db_clone2.borrow().tmdb_api_key.clone();
+                let year_cutoff = load_config().map(|c| c.year_cutoff).unwrap_or(1966);
                 
                 let (sender, receiver) = async_channel::unbounded::<(String, Option<(u32, Movie)>)>();
                 
@@ -2550,7 +2719,26 @@ fn build_ui(app: &Application) {
                         if let Ok(response) = client.get(&search_url).send() {
                             if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
                                 if !search_response.results.is_empty() {
-                                    let tmdb_movie_id = search_response.results[0].id;
+                                    // Prioritize movies before year_cutoff (same logic as fetch_movie_metadata_async)
+                                    let tmdb_movie_id = {
+                                        let before_cutoff = search_response.results.iter().find(|movie| {
+                                            if let Some(ref date) = movie.release_date {
+                                                if let Some(year_str) = date.split('-').next() {
+                                                    if let Ok(year) = year_str.parse::<i32>() {
+                                                        return year <= year_cutoff;
+                                                    }
+                                                }
+                                            }
+                                            false
+                                        });
+                                        
+                                        if let Some(movie) = before_cutoff {
+                                            movie.id
+                                        } else {
+                                            search_response.results[0].id
+                                        }
+                                    };
+                                    
                                     let details_url = format!(
                                         "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
                                         tmdb_movie_id, api_key
@@ -3003,6 +3191,7 @@ fn build_ui(app: &Application) {
             selection_dialog.set_child(Some(&dialog_box));
             
             let selection_dialog_clone = selection_dialog.clone();
+            let selection_dialog_clone3 = selection_dialog.clone();
             cancel_button.connect_clicked(move |_| {
                 selection_dialog_clone.close();
             });
@@ -3126,14 +3315,17 @@ fn build_ui(app: &Application) {
             let genre_dropdown_clone2 = genre_dropdown_clone.clone();
             let grid_flow_clone2 = grid_flow_clone.clone();
             let is_grid_view_clone2 = is_grid_view_clone.clone();
+            let selection_dialog_clone4 = selection_dialog_clone3.clone();
             glib::spawn_future_local(async move {
                 if let Ok(results) = receiver.recv().await {
-                    // Cache the results if not from cache
+                    // Cache the results if not from cache (safe borrow)
                     if !results.is_empty() {
-                        db_clone_for_cache.borrow_mut().cache_search_results(
-                            cache_key_for_save.clone(),
-                            results.clone()
-                        );
+                        if let Ok(mut db) = db_clone_for_cache.try_borrow_mut() {
+                            db.cache_search_results(
+                                cache_key_for_save.clone(),
+                                results.clone()
+                            );
+                        }
                     }
                     
                     // Remove loading message
@@ -3306,10 +3498,24 @@ fn build_ui(app: &Application) {
                                 let genre_dropdown = genre_dropdown_clone2.clone();
                                 let grid_flow = grid_flow_clone2.clone();
                                 let is_grid_view = is_grid_view_clone2.clone();
+                                let selection_dialog = selection_dialog_clone4.clone();
                                 glib::spawn_future_local(async move {
                                     if let Ok(Some((old_id, new_movie))) = receiver2.recv().await {
-                                        db_clone3.borrow_mut().delete_movie(old_id);
-                                        db_clone3.borrow_mut().add_movie(new_movie);
+                                        // Do delete and add in single borrow scope with error handling
+                                        match db_clone3.try_borrow_mut() {
+                                            Ok(mut db_mut) => {
+                                                db_mut.delete_movie(old_id);
+                                                db_mut.add_movie(new_movie);
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Failed to update movie - database busy: {}", e);
+                                                status_bar_clone3.set_text("Failed to update movie - try again");
+                                                return;
+                                            }
+                                        }
+                                        
+                                        // Close the selection dialog
+                                        selection_dialog.close();
                                         
                                         // Set sort to "Year (Newest)" - index 2
                                         sort_dropdown.set_selected(2);
@@ -3824,6 +4030,26 @@ fn build_ui(app: &Application) {
         // Load current config
         let current_config = load_config().unwrap_or_default();
         
+        // Year Cutoff section (after loading config)
+        let year_label = Label::new(Some("Year Cutoff for Auto-Scan:"));
+        year_label.set_xalign(0.0);
+        year_label.set_markup("<b>Year Cutoff for Auto-Scan:</b>");
+        
+        let year_help = Label::new(Some("Auto-scan will prioritize movies released before or in this year"));
+        year_help.set_xalign(0.0);
+        year_help.set_opacity(0.7);
+        year_help.set_wrap(true);
+        
+        let year_entry = Entry::new();
+        year_entry.set_text(&current_config.year_cutoff.to_string());
+        year_entry.set_max_length(4);
+        year_entry.set_width_chars(6);
+        
+        content.append(&year_label);
+        content.append(&year_help);
+        content.append(&year_entry);
+        content.append(&Separator::new(Orientation::Horizontal));
+        
         // List of scan directories
         let dirs_box = Box::new(Orientation::Vertical, 4);
         let dirs_list = Rc::new(RefCell::new(current_config.scan_directories.clone()));
@@ -3961,11 +4187,18 @@ fn build_ui(app: &Application) {
                 // Update database API key
                 db_clone2.borrow_mut().tmdb_api_key = new_key.clone();
                 
+                // Parse year cutoff
+                let year_cutoff = year_entry.text()
+                    .to_string()
+                    .parse::<i32>()
+                    .unwrap_or(1966);
+                
                 // Save to config
                 let config = Config {
                     tmdb_api_key: new_key,
                     scan_directories: dirs_list.borrow().clone(),
                     auto_scan_on_startup: auto_scan_check.is_active(),
+                    year_cutoff,
                 };
                 if let Err(e) = save_config(&config) {
                     status_bar_clone2.set_text(&format!("Error saving config: {}", e));
@@ -4136,11 +4369,22 @@ fn build_ui(app: &Application) {
         stats_dialog.set_child(Some(&scroll));
         stats_dialog.present();
     });
-
-    window.present();
 }
 
 fn main() {
+    // Set up panic handler to get better error messages
+    std::panic::set_hook(std::boxed::Box::new(|panic_info: &std::panic::PanicHookInfo| {
+        eprintln!("=== PANIC ===");
+        eprintln!("{}", panic_info);
+        if let Some(location) = panic_info.location() {
+            eprintln!("Location: {}:{}:{}", location.file(), location.line(), location.column());
+        }
+        if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            eprintln!("Panic message: {}", s);
+        }
+        eprintln!("=============");
+    }));
+    
     let app = Application::builder()
         .application_id("com.example.moviedb")
         .build();
