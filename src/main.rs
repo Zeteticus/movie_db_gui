@@ -1205,17 +1205,47 @@ fn build_ui(app: &Application) {
     // Show window first for fast startup
     window.present();
     
-    // Defer initial list population until after window is visible (prevents slow startup)
+    // Defer initial list population with batched loading (prevents slow startup and keeps UI responsive)
     let db_clone = db.clone();
     let db_clone2 = db.clone();
     let list_box_clone = list_box.clone();
     let poster_cache_clone = poster_cache.clone();
     glib::idle_add_local_once(move || {
         let movies = db_clone.borrow().list_all();
-        for movie in &movies {
-            let row = create_movie_row_with_context(movie, &poster_cache_clone, &db_clone2);
-            list_box_clone.append(&row);
-        }
+        let total = movies.len();
+        let batch_size = 50; // Add 50 movies at a time
+        
+        // Process movies in batches
+        let movies = Rc::new(movies);
+        let current_index = Rc::new(RefCell::new(0));
+        
+        let db_clone_batch = db_clone2.clone();
+        let list_box_batch = list_box_clone.clone();
+        let poster_cache_batch = poster_cache_clone.clone();
+        let movies_batch = movies.clone();
+        let current_index_batch = current_index.clone();
+        
+        glib::idle_add_local(move || {
+            let mut idx = current_index_batch.borrow_mut();
+            let start = *idx;
+            let end = (start + batch_size).min(total);
+            
+            // Add this batch of movies
+            for i in start..end {
+                let movie = &movies_batch[i];
+                let row = create_movie_row_with_context(movie, &poster_cache_batch, &db_clone_batch);
+                list_box_batch.append(&row);
+            }
+            
+            *idx = end;
+            
+            // Continue if there are more movies to load
+            if end < total {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
+            }
+        });
     });
 
     // Auto-scan on startup if enabled
@@ -1461,16 +1491,36 @@ fn build_ui(app: &Application) {
             results
         };
 
-        // Populate the active view
+        // Populate the active view with batching for responsiveness
+        let batch_size = 50;
+        
         if is_grid_view {
-            for movie in &results {
-                let item = create_movie_grid_item(movie, poster_cache);
-                grid_flow.append(&item);
+            for (idx, chunk) in results.chunks(batch_size).enumerate() {
+                for movie in chunk {
+                    let item = create_movie_grid_item(movie, poster_cache);
+                    grid_flow.append(&item);
+                }
+                
+                // Force UI update between batches for large collections
+                if idx < results.len() / batch_size {
+                    while gtk::glib::MainContext::default().pending() {
+                        gtk::glib::MainContext::default().iteration(false);
+                    }
+                }
             }
         } else {
-            for movie in &results {
-                let row = create_movie_row_with_context(movie, poster_cache, db);
-                list_box.append(&row);
+            for (idx, chunk) in results.chunks(batch_size).enumerate() {
+                for movie in chunk {
+                    let row = create_movie_row_with_context(movie, poster_cache, db);
+                    list_box.append(&row);
+                }
+                
+                // Force UI update between batches for large collections
+                if idx < results.len() / batch_size {
+                    while gtk::glib::MainContext::default().pending() {
+                        gtk::glib::MainContext::default().iteration(false);
+                    }
+                }
             }
         }
     }
