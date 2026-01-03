@@ -52,10 +52,16 @@ struct Config {
     scan_directories: Vec<String>,
     #[serde(default = "default_auto_scan")]
     auto_scan_on_startup: bool,
+    #[serde(default = "default_year_cutoff")]
+    year_cutoff: i32,
 }
 
 fn default_auto_scan() -> bool {
     true  // Enable by default
+}
+
+fn default_year_cutoff() -> i32 {
+    1966  // Default to pre-1966 movies
 }
 
 // Save config to file
@@ -133,6 +139,8 @@ struct TMDBSearchResponse {
 #[derive(Debug, Deserialize)]
 struct TMDBMovie {
     id: u32,
+    #[serde(default)]
+    release_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +256,7 @@ async fn fetch_movie_metadata_async(
     title: &str,
     file_path: String,
     posters_dir: String,
+    year_cutoff: i32,
 ) -> Option<Movie> {
     let search_url = format!(
         "https://api.themoviedb.org/3/search/movie?api_key={}&query={}",
@@ -268,7 +277,25 @@ async fn fetch_movie_metadata_async(
         return None;
     }
     
-    let movie_id = search_response.results[0].id;
+    // Prioritize movies before year_cutoff (filter by release_date)
+    let movie_id = {
+        let before_cutoff = search_response.results.iter().find(|movie| {
+            if let Some(ref date) = movie.release_date {
+                if let Some(year_str) = date.split('-').next() {
+                    if let Ok(year) = year_str.parse::<i32>() {
+                        return year <= year_cutoff;
+                    }
+                }
+            }
+            false
+        });
+        
+        if let Some(movie) = before_cutoff {
+            movie.id
+        } else {
+            search_response.results[0].id
+        }
+    };
     
     let details_url = format!(
         "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
@@ -1086,6 +1113,7 @@ fn build_ui(app: &Application) {
         let scan_dirs = config.scan_directories.clone();
         let api_key = db_clone.borrow().tmdb_api_key.clone();
         let posters_dir = db_clone.borrow().posters_dir.clone();
+        let year_cutoff = config.year_cutoff;
         
         dialog.choose(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |response| {
             if let Ok(1) = response {
@@ -1097,6 +1125,7 @@ fn build_ui(app: &Application) {
                 
                 let api_key_clone = api_key.clone();
                 let scan_dirs_clone = scan_dirs.clone();
+                let year_cutoff_clone = year_cutoff;
                 
                 // Extract existing file paths before spawning thread (Rc can't be sent between threads)
                 let existing_paths: std::collections::HashSet<String> = db_clone.borrow()
@@ -1155,7 +1184,7 @@ fn build_ui(app: &Application) {
                                     async move {
                                         let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                         
-                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir.clone()).await {
+                                        match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir.clone(), year_cutoff_clone).await {
                                             Some(movie) => {
                                                 let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                             }
@@ -2110,9 +2139,10 @@ fn build_ui(app: &Application) {
                     // Create async channel
                     let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
                     
-                    // Get API key, posters_dir, and existing paths before spawning thread (Rc can't be sent)
+                    // Get API key, posters_dir, year_cutoff, and existing paths before spawning thread (Rc can't be sent)
                     let api_key = db_clone3.borrow().tmdb_api_key.clone();
                     let posters_dir = db_clone3.borrow().posters_dir.clone();
+                    let year_cutoff = load_config().map(|c| c.year_cutoff).unwrap_or(1966);
                     let existing_paths: std::collections::HashSet<String> = db_clone3.borrow()
                         .movies
                         .values()
@@ -2167,7 +2197,7 @@ fn build_ui(app: &Application) {
                                         async move {
                                             let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
                                             
-                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir).await {
+                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir, year_cutoff).await {
                                                 Some(movie) => {
                                                     let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
                                                 }
@@ -2448,6 +2478,7 @@ fn build_ui(app: &Application) {
                 
                 let total_count = movies.len();
                 let api_key = db_clone2.borrow().tmdb_api_key.clone();
+                let year_cutoff = load_config().map(|c| c.year_cutoff).unwrap_or(1966);
                 
                 let (sender, receiver) = async_channel::unbounded::<(String, Option<(u32, Movie)>)>();
                 
@@ -2471,7 +2502,26 @@ fn build_ui(app: &Application) {
                         if let Ok(response) = client.get(&search_url).send() {
                             if let Ok(search_response) = response.json::<TMDBSearchResponse>() {
                                 if !search_response.results.is_empty() {
-                                    let tmdb_movie_id = search_response.results[0].id;
+                                    // Prioritize movies before year_cutoff (same logic as fetch_movie_metadata_async)
+                                    let tmdb_movie_id = {
+                                        let before_cutoff = search_response.results.iter().find(|movie| {
+                                            if let Some(ref date) = movie.release_date {
+                                                if let Some(year_str) = date.split('-').next() {
+                                                    if let Ok(year) = year_str.parse::<i32>() {
+                                                        return year <= year_cutoff;
+                                                    }
+                                                }
+                                            }
+                                            false
+                                        });
+                                        
+                                        if let Some(movie) = before_cutoff {
+                                            movie.id
+                                        } else {
+                                            search_response.results[0].id
+                                        }
+                                    };
+                                    
                                     let details_url = format!(
                                         "https://api.themoviedb.org/3/movie/{}?api_key={}&append_to_response=credits",
                                         tmdb_movie_id, api_key
@@ -3689,14 +3739,34 @@ fn build_ui(app: &Application) {
         content.append(&api_entry);
         content.append(&Separator::new(Orientation::Horizontal));
 
+        // Load current config (need it for year_cutoff)
+        let current_config = load_config().unwrap_or_default();
+        
+        // Year Cutoff section
+        let year_label = Label::new(Some("Year Cutoff for Auto-Scan:"));
+        year_label.set_xalign(0.0);
+        year_label.set_markup("<b>Year Cutoff for Auto-Scan:</b>");
+        
+        let year_help = Label::new(Some("Auto-scan will prioritize movies released before or in this year"));
+        year_help.set_xalign(0.0);
+        year_help.set_opacity(0.7);
+        year_help.set_wrap(true);
+        
+        let year_entry = Entry::new();
+        year_entry.set_text(&current_config.year_cutoff.to_string());
+        year_entry.set_max_length(4);
+        year_entry.set_width_chars(6);
+        
+        content.append(&year_label);
+        content.append(&year_help);
+        content.append(&year_entry);
+        content.append(&Separator::new(Orientation::Horizontal));
+
         // Scan directories section
         let scan_label = Label::new(Some("Scan Directories:"));
         scan_label.set_xalign(0.0);
         scan_label.set_markup("<b>Scan Directories:</b>");
         content.append(&scan_label);
-
-        // Load current config
-        let current_config = load_config().unwrap_or_default();
         
         // List of scan directories
         let dirs_box = Box::new(Orientation::Vertical, 4);
@@ -3835,11 +3905,18 @@ fn build_ui(app: &Application) {
                 // Update database API key
                 db_clone2.borrow_mut().tmdb_api_key = new_key.clone();
                 
+                // Parse year cutoff
+                let year_cutoff = year_entry.text()
+                    .to_string()
+                    .parse::<i32>()
+                    .unwrap_or(1966);
+                
                 // Save to config
                 let config = Config {
                     tmdb_api_key: new_key,
                     scan_directories: dirs_list.borrow().clone(),
                     auto_scan_on_startup: auto_scan_check.is_active(),
+                    year_cutoff,
                 };
                 if let Err(e) = save_config(&config) {
                     status_bar_clone2.set_text(&format!("Error saving config: {}", e));
