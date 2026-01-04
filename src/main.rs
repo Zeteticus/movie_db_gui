@@ -415,7 +415,9 @@ impl MovieDatabase {
         self.movies.insert(self.next_id, movie);
         self.next_id += 1;
         self.invalidate_result_cache();
-        self.save_to_file();
+        if let Err(e) = self.save_to_file() {
+            eprintln!("Warning: Failed to save database after adding movie: {}", e);
+        }
     }
 
     fn search_by_title(&self, query: &str) -> Vec<Movie> {
@@ -442,17 +444,25 @@ impl MovieDatabase {
     fn delete_movie(&mut self, id: u32) -> bool {
         if self.movies.remove(&id).is_some() {
             self.invalidate_result_cache();
-            self.save_to_file();
+            if let Err(e) = self.save_to_file() {
+                eprintln!("Warning: Failed to save database after deleting movie: {}", e);
+                // Still return true - movie was deleted from memory
+            }
             true
         } else {
             false
         }
     }
 
-    fn save_to_file(&self) {
+    fn save_to_file(&self) -> Result<(), String> {
         // Serialize entire database to JSON (including cache)
-        let json = serde_json::to_string_pretty(&self).expect("Unable to serialize database");
-        std::fs::write(&self.data_file, json).expect("Unable to write to file");
+        let json = serde_json::to_string_pretty(&self)
+            .map_err(|e| format!("Failed to serialize database: {}", e))?;
+        
+        std::fs::write(&self.data_file, json)
+            .map_err(|e| format!("Failed to write to file {}: {}", self.data_file, e))?;
+        
+        Ok(())
     }
 
     fn load_from_file(&mut self) {
@@ -514,7 +524,9 @@ impl MovieDatabase {
         
         // Save if we made any changes
         if needs_save {
-            self.save_to_file();
+            if let Err(e) = self.save_to_file() {
+                eprintln!("Warning: Failed to save after poster path migration: {}", e);
+            }
         }
     }
 
@@ -551,7 +563,9 @@ impl MovieDatabase {
         
         self.tmdb_cache.insert(query, cached);
         // Save to persist cache
-        self.save_to_file();
+        if let Err(e) = self.save_to_file() {
+            eprintln!("Warning: Failed to save TMDB cache: {}", e);
+        }
     }
     
     // Result cache methods for search/filter/sort
@@ -589,24 +603,27 @@ fn create_movie_row(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
         // Check cache first
-        let mut cache = poster_cache.borrow_mut();
+        let cache_borrow = poster_cache.borrow();
         
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Use cached pixbuf and scale for display (FAST!)
-            if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
-            }
+        if let Some(thumbnail) = cache_borrow.get(&movie.id) {
+            // Use cached thumbnail directly (FAST!)
+            let picture = Picture::for_pixbuf(thumbnail);
+            picture.set_can_shrink(true);
+            poster_box.append(&picture);
         } else {
-            // Load FULL RESOLUTION from disk and cache it
+            drop(cache_borrow); // Release read lock before writing
+            
+            // Load from disk and create thumbnail
             if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                // Cache the FULL resolution
-                cache.insert(movie.id, pixbuf.clone());
-                
-                // Scale for display
-                if let Some(scaled) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let picture = Picture::for_pixbuf(&scaled);
+                // Scale to thumbnail size BEFORE caching (saves 1500x memory!)
+                if let Some(thumbnail) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    // Cache ONLY the thumbnail (~16KB instead of ~24MB!)
+                    let mut cache_mut = poster_cache.borrow_mut();
+                    cache_mut.insert(movie.id, thumbnail.clone());
+                    drop(cache_mut);
+                    
+                    // Display the thumbnail
+                    let picture = Picture::for_pixbuf(&thumbnail);
                     picture.set_can_shrink(true);
                     poster_box.append(&picture);
                 }
@@ -693,6 +710,8 @@ fn create_movie_row_with_context(
         let file_path_clone = file_path.clone();
         let movie_title_clone = movie_title.clone();
         let menu_clone = menu.clone();
+        let db_clone_for_play = db_clone.clone();
+        let movie_id_for_play = movie_id;
         play_action.connect_activate(move |_, _| {
             if !file_path_clone.is_empty() && Path::new(&file_path_clone).exists() {
                 // Try regular VLC first
@@ -703,7 +722,25 @@ fn create_movie_row_with_context(
                     .spawn()
                 {
                     Ok(_) => {
-                        eprintln!("Playing: {}", movie_title_clone);
+                        // Auto-log to watch history
+                        if let Ok(mut db_mut) = db_clone_for_play.try_borrow_mut() {
+                            if let Some(movie) = db_mut.movies.get_mut(&movie_id_for_play) {
+                                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                let entry = WatchLogEntry {
+                                    date: today,
+                                    rating: None,
+                                    comments: String::from("Watched"),
+                                };
+                                movie.watch_log.push(entry);
+                            }
+                            if let Err(e) = db_mut.save_to_file() {
+                                eprintln!("Playing: {} (logged but save failed: {})", movie_title_clone, e);
+                            } else {
+                                eprintln!("Playing: {} (logged to watch history)", movie_title_clone);
+                            }
+                        } else {
+                            eprintln!("Playing: {} (couldn't log - database busy)", movie_title_clone);
+                        }
                     }
                     Err(_) => {
                         // Try flatpak VLC
@@ -714,7 +751,25 @@ fn create_movie_row_with_context(
                             .spawn()
                         {
                             Ok(_) => {
-                                eprintln!("Playing: {}", movie_title_clone);
+                                // Auto-log to watch history
+                                if let Ok(mut db_mut) = db_clone_for_play.try_borrow_mut() {
+                                    if let Some(movie) = db_mut.movies.get_mut(&movie_id_for_play) {
+                                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                        let entry = WatchLogEntry {
+                                            date: today,
+                                            rating: None,
+                                            comments: String::from("Watched"),
+                                        };
+                                        movie.watch_log.push(entry);
+                                    }
+                                    if let Err(e) = db_mut.save_to_file() {
+                                        eprintln!("Playing: {} (logged but save failed: {})", movie_title_clone, e);
+                                    } else {
+                                        eprintln!("Playing: {} (logged to watch history)", movie_title_clone);
+                                    }
+                                } else {
+                                    eprintln!("Playing: {} (couldn't log - database busy)", movie_title_clone);
+                                }
                             }
                             Err(_) => {
                                 eprintln!("VLC not found");
@@ -746,7 +801,7 @@ fn create_movie_row_with_context(
                     }
                 }
             } else {
-                eprintln!("Failed to delete movie");
+                eprintln!("Failed to delete movie - not found");
             }
             menu_clone2.popdown();
         });
@@ -778,26 +833,31 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
     poster_box.set_size_request(160, 240);
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        let mut cache = poster_cache.borrow_mut();
+        let cache_borrow = poster_cache.borrow();
         
-        if let Some(pixbuf) = cache.get(&movie.id) {
-            // Scale cached full-res for grid view (larger)
-            if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
+        if let Some(thumbnail) = cache_borrow.get(&movie.id) {
+            // Cache contains 60x90 thumbnail, scale up for grid (still better than loading from disk!)
+            if let Some(scaled) = thumbnail.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
                 let picture = Picture::for_pixbuf(&scaled);
                 picture.set_can_shrink(true);
                 poster_box.append(&picture);
             }
         } else {
-            // Load FULL RESOLUTION and cache it
-            if let Ok(pixbuf) = Pixbuf::from_file(&movie.poster_path) {
-                cache.insert(movie.id, pixbuf.clone());
-                
-                // Scale for display
-                if let Some(scaled) = pixbuf.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let picture = Picture::for_pixbuf(&scaled);
-                    picture.set_can_shrink(true);
-                    poster_box.append(&picture);
+            drop(cache_borrow); // Release read lock
+            
+            // Load from disk at grid size
+            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
+                // Store 60x90 thumbnail in cache for consistency with list view
+                if let Some(thumbnail) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                    let mut cache_mut = poster_cache.borrow_mut();
+                    cache_mut.insert(movie.id, thumbnail);
+                    drop(cache_mut);
                 }
+                
+                // Display at grid size
+                let picture = Picture::for_pixbuf(&pixbuf);
+                picture.set_can_shrink(true);
+                poster_box.append(&picture);
             }
         }
     } else {
@@ -1024,13 +1084,23 @@ fn build_ui(app: &Application) {
     main_box.append(&header);
     main_box.append(&Separator::new(Orientation::Horizontal));
 
+    // Status bar with loading spinner
+    let status_bar_box = Box::new(Orientation::Horizontal, 8);
+    status_bar_box.set_margin_start(12);
+    status_bar_box.set_margin_end(12);
+    status_bar_box.set_margin_top(6);
+    status_bar_box.set_margin_bottom(6);
+    
     let status_bar = Label::new(Some("Ready"));
     status_bar.set_xalign(0.0);
-    status_bar.set_margin_start(12);
-    status_bar.set_margin_end(12);
-    status_bar.set_margin_top(6);
-    status_bar.set_margin_bottom(6);
-    main_box.append(&status_bar);
+    status_bar.set_hexpand(true);
+    
+    let loading_spinner = gtk::Spinner::new();
+    loading_spinner.set_visible(false); // Hidden by default
+    
+    status_bar_box.append(&status_bar);
+    status_bar_box.append(&loading_spinner);
+    main_box.append(&status_bar_box);
 
     let search_box = Box::new(Orientation::Horizontal, 12);
     search_box.set_margin_start(12);
@@ -1210,10 +1280,17 @@ fn build_ui(app: &Application) {
     let db_clone2 = db.clone();
     let list_box_clone = list_box.clone();
     let poster_cache_clone = poster_cache.clone();
+    let status_bar_clone = status_bar.clone();
+    let loading_spinner_clone = loading_spinner.clone();
     glib::idle_add_local_once(move || {
         let movies = db_clone.borrow().list_all();
         let total = movies.len();
         let batch_size = 50; // Add 50 movies at a time
+        
+        // Show loading indicator
+        loading_spinner_clone.set_visible(true);
+        loading_spinner_clone.start();
+        status_bar_clone.set_text(&format!("Loading {} movies...", total));
         
         // Process movies in batches
         let movies = Rc::new(movies);
@@ -1224,6 +1301,8 @@ fn build_ui(app: &Application) {
         let poster_cache_batch = poster_cache_clone.clone();
         let movies_batch = movies.clone();
         let current_index_batch = current_index.clone();
+        let status_bar_batch = status_bar_clone.clone();
+        let loading_spinner_batch = loading_spinner_clone.clone();
         
         glib::idle_add_local(move || {
             let mut idx = current_index_batch.borrow_mut();
@@ -1239,10 +1318,17 @@ fn build_ui(app: &Application) {
             
             *idx = end;
             
+            // Update progress
+            status_bar_batch.set_text(&format!("Loaded {}/{} movies...", end, total));
+            
             // Continue if there are more movies to load
             if end < total {
                 glib::ControlFlow::Continue
             } else {
+                // Done loading - hide spinner
+                loading_spinner_batch.stop();
+                loading_spinner_batch.set_visible(false);
+                status_bar_batch.set_text(&format!("Ready - {} movies loaded", total));
                 glib::ControlFlow::Break
             }
         });
@@ -1758,20 +1844,32 @@ fn build_ui(app: &Application) {
                         .spawn()
                     {
                         Ok(_) => {
-                            // Auto-log to watch history
-                            let mut db_mut = db_clone.borrow_mut();
-                            if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
-                                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                                let entry = WatchLogEntry {
-                                    date: today,
-                                    rating: None,
-                                    comments: String::from("Watched"),
-                                };
-                                movie.watch_log.push(entry);
-                            }
-                            db_mut.save_to_file();
-                            drop(db_mut);
-                            status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
+                            status_bar_clone.set_text(&format!("Playing: {}", movie_title));
+                            
+                            // Auto-log to watch history (asynchronously - don't block VLC launch)
+                            let db_clone_async = db_clone.clone();
+                            let movie_title_async = movie_title.clone();
+                            let status_bar_async = status_bar_clone.clone();
+                            glib::spawn_future_local(async move {
+                                // Small delay to ensure VLC has launched
+                                glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                                
+                                let mut db_mut = db_clone_async.borrow_mut();
+                                if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                    let entry = WatchLogEntry {
+                                        date: today,
+                                        rating: None,
+                                        comments: String::from("Watched"),
+                                    };
+                                    movie.watch_log.push(entry);
+                                }
+                                if let Err(e) = db_mut.save_to_file() {
+                                    eprintln!("Warning: Failed to save watch log: {}", e);
+                                } else {
+                                    status_bar_async.set_text(&format!("Playing: {} (logged)", movie_title_async));
+                                }
+                            });
                         }
                         Err(_) => {
                             // Try flatpak version
@@ -1782,20 +1880,31 @@ fn build_ui(app: &Application) {
                                 .spawn()
                             {
                                 Ok(_) => {
-                                    // Auto-log to watch history
-                                    let mut db_mut = db_clone.borrow_mut();
-                                    if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
-                                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                                        let entry = WatchLogEntry {
-                                            date: today,
-                                            rating: None,
-                                            comments: String::from("Watched"),
-                                        };
-                                        movie.watch_log.push(entry);
-                                    }
-                                    db_mut.save_to_file();
-                                    drop(db_mut);
-                                    status_bar_clone.set_text(&format!("Playing: {} (logged to watch history)", movie_title));
+                                    status_bar_clone.set_text(&format!("Playing: {}", movie_title));
+                                    
+                                    // Auto-log to watch history (asynchronously)
+                                    let db_clone_async = db_clone.clone();
+                                    let movie_title_async = movie_title.clone();
+                                    let status_bar_async = status_bar_clone.clone();
+                                    glib::spawn_future_local(async move {
+                                        glib::timeout_future(std::time::Duration::from_millis(100)).await;
+                                        
+                                        let mut db_mut = db_clone_async.borrow_mut();
+                                        if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                                            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                            let entry = WatchLogEntry {
+                                                date: today,
+                                                rating: None,
+                                                comments: String::from("Watched"),
+                                            };
+                                            movie.watch_log.push(entry);
+                                        }
+                                        if let Err(e) = db_mut.save_to_file() {
+                                            eprintln!("Warning: Failed to save watch log: {}", e);
+                                        } else {
+                                            status_bar_async.set_text(&format!("Playing: {} (logged)", movie_title_async));
+                                        }
+                                    });
                                 }
                                 Err(_) => {
                                     status_bar_clone.set_text("VLC not found. Please install VLC.");
@@ -1842,7 +1951,9 @@ fn build_ui(app: &Application) {
                     if let Some(movie) = db.movies.get_mut(&movie_id) {
                         movie.file_path = file_path.clone();
                         drop(db); // Release borrow
-                        db_clone2.borrow_mut().save_to_file();
+                        if let Err(e) = db_clone2.borrow_mut().save_to_file() {
+                            eprintln!("Warning: Failed to save file association: {}", e);
+                        }
                         
                         // Refresh details display
                         let db = db_clone2.borrow();
@@ -1947,6 +2058,46 @@ fn build_ui(app: &Application) {
             });
         }
     });
+
+    // Keyboard shortcuts
+    let event_controller = gtk::EventControllerKey::new();
+    let search_entry_shortcut = search_entry.clone();
+    let selected_movie_id_shortcut = selected_movie_id.clone();
+    let play_button_shortcut = play_button.clone();
+    let delete_button_shortcut = delete_button.clone();
+    
+    event_controller.connect_key_pressed(move |_, key, _code, modifier| {
+        use gtk::gdk::Key;
+        use gtk::gdk::ModifierType;
+        
+        // Ctrl+F: Focus search
+        if modifier.contains(ModifierType::CONTROL_MASK) && key == Key::f {
+            search_entry_shortcut.grab_focus();
+            return gtk::glib::Propagation::Stop;
+        }
+        
+        // Delete: Delete selected movie
+        if key == Key::Delete {
+            let movie_id = *selected_movie_id_shortcut.borrow();
+            if movie_id > 0 {
+                delete_button_shortcut.emit_clicked();
+            }
+            return gtk::glib::Propagation::Stop;
+        }
+        
+        // Space: Play selected movie
+        if key == Key::space {
+            let movie_id = *selected_movie_id_shortcut.borrow();
+            if movie_id > 0 {
+                play_button_shortcut.emit_clicked();
+                return gtk::glib::Propagation::Stop;
+            }
+        }
+        
+        gtk::glib::Propagation::Proceed
+    });
+    
+    window.add_controller(event_controller);
 
     // Show Cast button - display cast photos
     let db_clone = db.clone();
@@ -2257,7 +2408,9 @@ fn build_ui(app: &Application) {
                 let mut db = db_clone2.borrow_mut();
                 if let Some(movie) = db.movies.get_mut(&movie_id) {
                     movie.watch_log.push(entry.clone());
-                    db.save_to_file();
+                    if let Err(e) = db.save_to_file() {
+                        eprintln!("Warning: Failed to save watch log entry: {}", e);
+                    }
                 }
                 drop(db);
                 
@@ -3019,7 +3172,9 @@ fn build_ui(app: &Application) {
                 }
                 drop(db);
                 
-                db_clone2.borrow_mut().save_to_file();
+                if let Err(e) = db_clone2.borrow_mut().save_to_file() {
+                    eprintln!("Warning: Failed to save edited metadata: {}", e);
+                }
                 
                 // Refresh UI
                 let db = db_clone2.borrow();
