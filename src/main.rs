@@ -251,13 +251,13 @@ fn download_poster(poster_url: &str, movie_id: u32, posters_dir: &str) -> Option
     Some(poster_path)
 }
 
-fn download_cast_photo(photo_url: &str, cast_photos_dir: &str) -> Option<String> {
+async fn download_cast_photo_async(photo_url: &str, cast_photos_dir: &str, client: &reqwest::Client) -> Option<String> {
     if photo_url.is_empty() {
         return None;
     }
     
-    // Create cast_photos directory if it doesn't exist
-    create_dir_all(cast_photos_dir).ok()?;
+    let cast_photos_dir = cast_photos_dir.to_string();
+    let photo_url = photo_url.to_string();
     
     // Extract filename from URL path
     let filename = photo_url
@@ -267,18 +267,32 @@ fn download_cast_photo(photo_url: &str, cast_photos_dir: &str) -> Option<String>
     
     let photo_path = format!("{}/{}", cast_photos_dir, filename);
     
-    // Skip if already downloaded
-    if Path::new(&photo_path).exists() {
+    // Check if already downloaded (blocking operation in spawn_blocking)
+    let photo_path_check = photo_path.clone();
+    let exists = tokio::task::spawn_blocking(move || {
+        Path::new(&photo_path_check).exists()
+    }).await.ok()?;
+    
+    if exists {
         return Some(photo_path);
     }
     
-    // Download the photo
-    let response = reqwest::blocking::get(photo_url).ok()?;
-    let bytes = response.bytes().ok()?;
+    // Create directory if needed (blocking operation)
+    let cast_photos_dir_clone = cast_photos_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        create_dir_all(&cast_photos_dir_clone)
+    }).await.ok()?.ok()?;
     
-    // Save to local file
-    let mut file = File::create(&photo_path).ok()?;
-    std::io::copy(&mut bytes.as_ref(), &mut file).ok()?;
+    // Download the photo
+    let response = client.get(&photo_url).send().await.ok()?;
+    let bytes = response.bytes().await.ok()?;
+    
+    // Save to local file (blocking operation in spawn_blocking)
+    let photo_path_write = photo_path.clone();
+    let bytes_vec = bytes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&photo_path_write, bytes_vec)
+    }).await.ok()?.ok()?;
     
     Some(photo_path)
 }
@@ -375,12 +389,21 @@ async fn fetch_movie_metadata_async(
         })
         .collect();
     
-    // Download cast photos
+    // Download cast photos asynchronously
     let cast_photos_dir = Path::new(&posters_dir).parent().unwrap().join("cast_photos");
-    let cast_photos_dir_str = cast_photos_dir.to_str().unwrap();
+    let cast_photos_dir_str = cast_photos_dir.to_string_lossy().to_string();
+    eprintln!("Cast photos directory: {}", cast_photos_dir_str);
+    eprintln!("Found {} cast members with details", cast_details.len());
     for cast_member in &cast_details {
         if !cast_member.profile_path.is_empty() {
-            download_cast_photo(&cast_member.profile_path, cast_photos_dir_str);
+            eprintln!("Downloading photo for: {} from {}", cast_member.name, cast_member.profile_path);
+            if let Some(path) = download_cast_photo_async(&cast_member.profile_path, &cast_photos_dir_str, client).await {
+                eprintln!("  ✓ Saved to: {}", path);
+            } else {
+                eprintln!("  ✗ Failed to download");
+            }
+        } else {
+            eprintln!("No photo URL for: {}", cast_member.name);
         }
     }
     
@@ -953,8 +976,15 @@ fn create_movie_row_with_context(
                         if !cast_member.profile_path.is_empty() {
                             // Try to load cached photo
                             let cache_dir = std::path::Path::new(&db_clone2.borrow().posters_dir).parent().unwrap().join("cast_photos");
-                            let photo_filename = cast_member.profile_path.trim_start_matches('/').replace('/', "_");
+                            
+                            // Extract filename the same way we save it
+                            let photo_filename = cast_member.profile_path
+                                .trim_start_matches("https://image.tmdb.org/t/p/w185")
+                                .trim_start_matches('/')
+                                .replace('/', "_");
                             let cached_path = cache_dir.join(&photo_filename);
+                            
+                            eprintln!("Looking for cast photo: {:?} (exists: {})", cached_path, cached_path.exists());
                             
                             if cached_path.exists() {
                                 if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file(&cached_path) {
@@ -3079,6 +3109,11 @@ fn build_ui(app: &Application) {
                     let mut success_count = 0;
                     let mut fail_count = 0;
                     
+                    // Create cast_photos directory at the start
+                    let cast_photos_dir = std::path::Path::new(&posters_dir).parent().unwrap().join("cast_photos");
+                    std::fs::create_dir_all(&cast_photos_dir).ok();
+                    eprintln!("[Refresh All] Will download cast photos to: {:?}", cast_photos_dir);
+                    
                     for (i, (movie_id, title, file_path)) in movies.iter().enumerate() {
                         let progress = format!("Refreshing {}/{}: {}", i + 1, total_count, title);
                         let _ = sender.send_blocking((progress, None));
@@ -3151,6 +3186,25 @@ fn build_ui(app: &Application) {
                                                 })
                                                 .collect();
                                             
+                                            
+                                            // Download cast photos
+                                            for cast_member in &cast_details {
+                                                if !cast_member.profile_path.is_empty() {
+                                                    let filename = cast_member.profile_path
+                                                        .trim_start_matches("https://image.tmdb.org/t/p/w185")
+                                                        .trim_start_matches('/')
+                                                        .replace('/', "_");
+                                                    let photo_path = cast_photos_dir.join(&filename);
+                                                    
+                                                    if !photo_path.exists() {
+                                                        if let Ok(response) = client.get(&cast_member.profile_path).send() {
+                                                            if let Ok(bytes) = response.bytes() {
+                                                                let _ = std::fs::write(&photo_path, bytes);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             let genres: Vec<String> = details.genres
                                                 .iter()
                                                 .map(|g| g.name.clone())
