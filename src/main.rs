@@ -251,6 +251,38 @@ fn download_poster(poster_url: &str, movie_id: u32, posters_dir: &str) -> Option
     Some(poster_path)
 }
 
+fn download_cast_photo(photo_url: &str, cast_photos_dir: &str) -> Option<String> {
+    if photo_url.is_empty() {
+        return None;
+    }
+    
+    // Create cast_photos directory if it doesn't exist
+    create_dir_all(cast_photos_dir).ok()?;
+    
+    // Extract filename from URL path
+    let filename = photo_url
+        .trim_start_matches("https://image.tmdb.org/t/p/w185")
+        .trim_start_matches('/')
+        .replace('/', "_");
+    
+    let photo_path = format!("{}/{}", cast_photos_dir, filename);
+    
+    // Skip if already downloaded
+    if Path::new(&photo_path).exists() {
+        return Some(photo_path);
+    }
+    
+    // Download the photo
+    let response = reqwest::blocking::get(photo_url).ok()?;
+    let bytes = response.bytes().ok()?;
+    
+    // Save to local file
+    let mut file = File::create(&photo_path).ok()?;
+    std::io::copy(&mut bytes.as_ref(), &mut file).ok()?;
+    
+    Some(photo_path)
+}
+
 // Async function to fetch metadata for a single movie (non-blocking)
 async fn fetch_movie_metadata_async(
     client: &reqwest::Client,
@@ -342,6 +374,15 @@ async fn fetch_movie_metadata_async(
                 .unwrap_or_default(),
         })
         .collect();
+    
+    // Download cast photos
+    let cast_photos_dir = Path::new(&posters_dir).parent().unwrap().join("cast_photos");
+    let cast_photos_dir_str = cast_photos_dir.to_str().unwrap();
+    for cast_member in &cast_details {
+        if !cast_member.profile_path.is_empty() {
+            download_cast_photo(&cast_member.profile_path, cast_photos_dir_str);
+        }
+    }
     
     let genres: Vec<String> = details.genres
         .iter()
@@ -696,6 +737,7 @@ fn create_movie_row_with_context(
     gesture.connect_released(move |_, _, x, y| {
         let menu_model = gtk::gio::Menu::new();
         menu_model.append(Some("▶️ Play in VLC"), Some("movie.play"));
+        menu_model.append(Some("ℹ️ View Details"), Some("movie.details"));
         menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
         
         let menu = gtk::PopoverMenu::from_model(Some(&menu_model));
@@ -781,6 +823,207 @@ fn create_movie_row_with_context(
             menu_clone.popdown();
         });
         
+        // View Details action
+        let details_action = gtk::gio::SimpleAction::new("details", None);
+        let db_clone2 = db_clone.clone();
+        let menu_clone_details = menu.clone();
+        details_action.connect_activate(move |_, _| {
+            let db = db_clone2.borrow();
+            if let Some(movie) = db.movies.get(&movie_id) {
+                // Create details dialog
+                let details_dialog = gtk::Window::builder()
+                    .title(&format!("{} - Details", movie.title))
+                    .modal(true)
+                    .default_width(700)
+                    .default_height(600)
+                    .build();
+                
+                let scroll = gtk::ScrolledWindow::new();
+                scroll.set_vexpand(true);
+                
+                let details_box = gtk::Box::new(gtk::Orientation::Vertical, 16);
+                details_box.set_margin_start(20);
+                details_box.set_margin_end(20);
+                details_box.set_margin_top(20);
+                details_box.set_margin_bottom(20);
+                
+                // Poster at top
+                if !movie.poster_path.is_empty() && std::path::Path::new(&movie.poster_path).exists() {
+                    if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file(&movie.poster_path) {
+                        if let Some(scaled) = pixbuf.scale_simple(200, 300, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                            let poster_img = gtk::Picture::for_pixbuf(&scaled);
+                            poster_img.set_halign(gtk::Align::Center);
+                            details_box.append(&poster_img);
+                        }
+                    }
+                }
+                
+                // Movie information
+                let info_label = gtk::Label::new(None);
+                info_label.set_xalign(0.0);
+                info_label.set_wrap(true);
+                info_label.set_selectable(true);
+                
+                let escaped_title = escape_markup(&movie.title);
+                let escaped_director = escape_markup(&movie.director);
+                let escaped_genre = escape_markup(&movie.genre.join(", "));
+                let escaped_description = escape_markup(&movie.description);
+                let escaped_file = escape_markup(&movie.file_path);
+                
+                let cast_display = if !movie.cast.is_empty() {
+                    movie.cast.iter().map(|n| escape_markup(n)).collect::<Vec<_>>().join("\n    • ")
+                } else {
+                    String::from("Unknown")
+                };
+                
+                let imdb_display = if !movie.imdb_id.is_empty() {
+                    format!("{} (https://www.imdb.com/title/{})", movie.imdb_id, movie.imdb_id)
+                } else {
+                    String::from("Not available")
+                };
+                
+                let watch_log_display = if !movie.watch_log.is_empty() {
+                    movie.watch_log.iter()
+                        .map(|entry| {
+                            let rating = entry.rating.map(|r| format!(" - Rated: {}/10", r)).unwrap_or_default();
+                            let comments = if !entry.comments.is_empty() {
+                                format!(" - {}", escape_markup(&entry.comments))
+                            } else {
+                                String::new()
+                            };
+                            format!("    • {}{}{}", entry.date, rating, comments)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::from("Not yet watched")
+                };
+                
+                let details_text = format!(
+                    "<b>{}</b> ({})\n\n\
+                    <b>Director:</b> {}\n\
+                    <b>Genre:</b> {}\n\
+                    <b>Rating:</b> ⭐ {:.1}/10\n\
+                    <b>Runtime:</b> {} minutes\n\
+                    <b>IMDb ID:</b> {}\n\n\
+                    <b>Description:</b>\n{}\n\n\
+                    <b>Cast:</b>\n    • {}\n\n\
+                    <b>Watch History:</b>\n{}\n\n\
+                    <b>File:</b> {}",
+                    escaped_title, movie.year,
+                    escaped_director,
+                    escaped_genre,
+                    movie.rating,
+                    movie.runtime,
+                    imdb_display,
+                    escaped_description,
+                    cast_display,
+                    watch_log_display,
+                    escaped_file
+                );
+                
+                info_label.set_markup(&details_text);
+                details_box.append(&info_label);
+                
+                // Cast photos section (if available)
+                if !movie.cast_details.is_empty() {
+                    let cast_label = gtk::Label::new(None);
+                    cast_label.set_markup("<b>Cast Photos:</b>");
+                    cast_label.set_xalign(0.0);
+                    cast_label.set_margin_top(12);
+                    details_box.append(&cast_label);
+                    
+                    let cast_flow = gtk::FlowBox::new();
+                    cast_flow.set_selection_mode(gtk::SelectionMode::None);
+                    cast_flow.set_column_spacing(12);
+                    cast_flow.set_row_spacing(12);
+                    cast_flow.set_margin_top(8);
+                    cast_flow.set_homogeneous(true);
+                    cast_flow.set_max_children_per_line(4);
+                    
+                    for cast_member in &movie.cast_details {
+                        let member_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                        member_box.set_size_request(120, 200);
+                        
+                        // Photo
+                        let photo_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                        photo_box.set_size_request(100, 150);
+                        photo_box.set_halign(gtk::Align::Center);
+                        
+                        if !cast_member.profile_path.is_empty() {
+                            // Try to load cached photo
+                            let cache_dir = std::path::Path::new(&db_clone2.borrow().posters_dir).parent().unwrap().join("cast_photos");
+                            let photo_filename = cast_member.profile_path.trim_start_matches('/').replace('/', "_");
+                            let cached_path = cache_dir.join(&photo_filename);
+                            
+                            if cached_path.exists() {
+                                if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_file(&cached_path) {
+                                    if let Some(scaled) = pixbuf.scale_simple(100, 150, gtk::gdk_pixbuf::InterpType::Bilinear) {
+                                        let photo = gtk::Picture::for_pixbuf(&scaled);
+                                        photo_box.append(&photo);
+                                    }
+                                }
+                            } else {
+                                // Placeholder if not cached
+                                let placeholder = gtk::Label::new(Some("👤"));
+                                placeholder.set_markup("<span size='xx-large'>👤</span>");
+                                photo_box.append(&placeholder);
+                            }
+                        } else {
+                            let placeholder = gtk::Label::new(Some("👤"));
+                            placeholder.set_markup("<span size='xx-large'>👤</span>");
+                            photo_box.append(&placeholder);
+                        }
+                        
+                        member_box.append(&photo_box);
+                        
+                        // Name
+                        let name_label = gtk::Label::new(Some(&cast_member.name));
+                        name_label.set_xalign(0.5);
+                        name_label.set_wrap(true);
+                        name_label.set_max_width_chars(15);
+                        name_label.set_markup(&format!("<b>{}</b>", escape_markup(&cast_member.name)));
+                        member_box.append(&name_label);
+                        
+                        // Character
+                        if !cast_member.character.is_empty() {
+                            let char_label = gtk::Label::new(Some(&cast_member.character));
+                            char_label.set_xalign(0.5);
+                            char_label.set_wrap(true);
+                            char_label.set_max_width_chars(15);
+                            char_label.set_markup(&format!("<i><small>{}</small></i>", escape_markup(&cast_member.character)));
+                            member_box.append(&char_label);
+                        }
+                        
+                        cast_flow.append(&member_box);
+                    }
+                    
+                    details_box.append(&cast_flow);
+                } else if movie.cast_details.is_empty() && !movie.cast.is_empty() {
+                    // Show message if cast photos aren't available yet
+                    let cast_note = gtk::Label::new(None);
+                    cast_note.set_markup("<i><small>Cast photos not available. Refresh metadata to download.</small></i>");
+                    cast_note.set_xalign(0.0);
+                    cast_note.set_margin_top(8);
+                    details_box.append(&cast_note);
+                }
+                
+                // Close button
+                let close_btn = gtk::Button::with_label("Close");
+                close_btn.set_halign(gtk::Align::Center);
+                let dialog_clone = details_dialog.clone();
+                close_btn.connect_clicked(move |_| {
+                    dialog_clone.close();
+                });
+                details_box.append(&close_btn);
+                
+                scroll.set_child(Some(&details_box));
+                details_dialog.set_child(Some(&scroll));
+                details_dialog.present();
+            }
+            menu_clone_details.popdown();
+        });
+        
         // Delete action
         let delete_action = gtk::gio::SimpleAction::new("delete", None);
         let db_clone3 = db_clone.clone();
@@ -807,6 +1050,7 @@ fn create_movie_row_with_context(
         });
         
         actions.add_action(&play_action);
+        actions.add_action(&details_action);
         actions.add_action(&delete_action);
         menu.insert_action_group("movie", Some(&actions));
         
@@ -1217,7 +1461,8 @@ fn build_ui(app: &Application) {
     details_frame.set_child(Some(&details_main_box));
     details_container.append(&details_frame);
     
-    main_box.append(&details_container);
+    // REMOVED: Details panel now in right-click menu instead
+    // main_box.append(&details_container);
     
     // Toggle button handler
     let details_frame_clone = details_frame.clone();
