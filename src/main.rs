@@ -1107,31 +1107,18 @@ fn create_movie_grid_item(movie: &Movie, poster_cache: &Rc<RefCell<HashMap<u32, 
     poster_box.set_size_request(160, 240);
     
     if !movie.poster_path.is_empty() && Path::new(&movie.poster_path).exists() {
-        let cache_borrow = poster_cache.borrow();
-        
-        if let Some(thumbnail) = cache_borrow.get(&movie.id) {
-            // Cache contains 60x90 thumbnail, scale up for grid (still better than loading from disk!)
-            if let Some(scaled) = thumbnail.scale_simple(160, 240, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                let picture = Picture::for_pixbuf(&scaled);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
-            }
-        } else {
-            drop(cache_borrow); // Release read lock
+        // For grid view, always load from disk at proper size (160×240)
+        // Don't scale up the small list thumbnails - that causes blurriness!
+        if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
+            let picture = Picture::for_pixbuf(&pixbuf);
+            picture.set_can_shrink(true);
+            poster_box.append(&picture);
             
-            // Load from disk at grid size
-            if let Ok(pixbuf) = Pixbuf::from_file_at_scale(&movie.poster_path, 160, 240, true) {
-                // Store 60x90 thumbnail in cache for consistency with list view
+            // Also ensure we have a thumbnail cached for list view
+            if poster_cache.borrow().get(&movie.id).is_none() {
                 if let Some(thumbnail) = pixbuf.scale_simple(60, 90, gtk::gdk_pixbuf::InterpType::Bilinear) {
-                    let mut cache_mut = poster_cache.borrow_mut();
-                    cache_mut.insert(movie.id, thumbnail);
-                    drop(cache_mut);
+                    poster_cache.borrow_mut().insert(movie.id, thumbnail);
                 }
-                
-                // Display at grid size
-                let picture = Picture::for_pixbuf(&pixbuf);
-                picture.set_can_shrink(true);
-                poster_box.append(&picture);
             }
         }
     } else {
