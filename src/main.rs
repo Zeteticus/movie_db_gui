@@ -899,7 +899,7 @@ fn create_movie_row_with_context(
                 let info_label = gtk::Label::new(None);
                 info_label.set_xalign(0.0);
                 info_label.set_wrap(true);
-                info_label.set_selectable(true);
+                info_label.set_selectable(false);  // Disable text selection to prevent highlighting
                 
                 let escaped_title = escape_markup(&movie.title);
                 let escaped_director = escape_markup(&movie.director);
@@ -1063,6 +1063,19 @@ fn create_movie_row_with_context(
                 
                 scroll.set_child(Some(&details_box));
                 details_dialog.set_child(Some(&scroll));
+                
+                // Add Escape key handler to close dialog
+                let key_controller = gtk::EventControllerKey::new();
+                let dialog_for_escape = details_dialog.clone();
+                key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
+                    if key == gtk::gdk::Key::Escape {
+                        dialog_for_escape.close();
+                        return gtk::glib::Propagation::Stop;
+                    }
+                    gtk::glib::Propagation::Proceed
+                });
+                details_dialog.add_controller(key_controller);
+                
                 details_dialog.present();
             }
             menu_clone_details.popdown();
@@ -1293,7 +1306,7 @@ fn scan_directory_recursive(
 fn build_ui(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Mark's Movie Database (MMDB)")
+        .title("My MovieDB")
         .default_width(1000)
         .default_height(700)
         .maximized(true)
@@ -1330,8 +1343,8 @@ fn build_ui(app: &Application) {
     header.set_margin_top(12);
     header.set_margin_bottom(12);
 
-    let title_label = Label::new(Some("📽️ Mark's Movie Database"));
-    title_label.set_markup("<span size='x-large' weight='bold'>📽️ Mark's Movie Database</span>");
+    let title_label = Label::new(Some("📽️ My MovieDB"));
+    title_label.set_markup("<span size='x-large' weight='bold'>📽️ My MovieDB</span>");
     
     let scan_button = Button::with_label("📁 Scan Directory");
     let add_button = Button::with_label("➕ Add Movie");
@@ -1342,11 +1355,13 @@ fn build_ui(app: &Application) {
     let select_version_button = Button::with_label("🎞️ Wrong Movie?");
     let stats_button = Button::with_label("📊 Statistics");
     let settings_button = Button::with_label("⚙️ Settings");
+    let help_button = Button::with_label("❓ Help");
     
     header.append(&title_label);
     header.append(&Box::new(Orientation::Horizontal, 0));
     header.set_hexpand(true);
     title_label.set_hexpand(true);
+    header.append(&help_button);
     header.append(&stats_button);
     header.append(&settings_button);
     header.append(&refresh_all_button);
@@ -1551,6 +1566,101 @@ fn build_ui(app: &Application) {
             button.set_label("📋 List");
             scrolled_clone.set_child(Some(&list_box_clone_toggle));
         }
+    });
+
+    // Help button - show About dialog
+    let window_clone = window.clone();
+    help_button.connect_clicked(move |_| {
+        let about_dialog = gtk::Window::builder()
+            .title("About My MovieDB")
+            .modal(true)
+            .transient_for(&window_clone)
+            .default_width(500)
+            .default_height(400)
+            .build();
+        
+        let about_box = gtk::Box::new(gtk::Orientation::Vertical, 20);
+        about_box.set_margin_start(40);
+        about_box.set_margin_end(40);
+        about_box.set_margin_top(40);
+        about_box.set_margin_bottom(40);
+        about_box.set_halign(gtk::Align::Center);
+        
+        // App name
+        let name_label = gtk::Label::new(None);
+        name_label.set_markup("<span size='xx-large' weight='bold'>My MovieDB</span>");
+        about_box.append(&name_label);
+        
+        // Version
+        let version_label = gtk::Label::new(None);
+        version_label.set_markup("<span size='large'>Version 1.0.1</span>");
+        about_box.append(&version_label);
+        
+        // Description
+        let desc_label = gtk::Label::new(None);
+        desc_label.set_markup("<span size='medium'>A movie collection manager with TMDB integration</span>");
+        desc_label.set_wrap(true);
+        desc_label.set_justify(gtk::Justification::Center);
+        about_box.append(&desc_label);
+        
+        // Separator
+        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        
+        // Features
+        let features_label = gtk::Label::new(None);
+        features_label.set_markup(
+            "<b>Features:</b>\n\
+            • TMDB metadata integration\n\
+            • HD poster downloads\n\
+            • Cast photos and details\n\
+            • Watch history tracking\n\
+            • Search by title or cast member\n\
+            • Multiple views (list/grid)\n\
+            • Year filtering\n\
+            • VLC integration"
+        );
+        features_label.set_xalign(0.0);
+        about_box.append(&features_label);
+        
+        // Separator
+        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        
+        // Keyboard shortcuts
+        let shortcuts_label = gtk::Label::new(None);
+        shortcuts_label.set_markup(
+            "<b>Keyboard Shortcuts:</b>\n\
+            • Ctrl+F - Focus search\n\
+            • Space - Play selected movie\n\
+            • Delete - Delete movie metadata\n\
+            • Escape - Close dialogs"
+        );
+        shortcuts_label.set_xalign(0.0);
+        about_box.append(&shortcuts_label);
+        
+        // Close button
+        let close_btn = gtk::Button::with_label("Close");
+        close_btn.set_halign(gtk::Align::Center);
+        close_btn.set_margin_top(20);
+        let dialog_clone = about_dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_clone.close();
+        });
+        about_box.append(&close_btn);
+        
+        // Add Escape key handler
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = about_dialog.clone();
+        key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
+            if key == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        about_dialog.add_controller(key_controller);
+        
+        about_dialog.set_child(Some(&about_box));
+        about_dialog.present();
     });
 
     // Show window first for fast startup
