@@ -493,6 +493,20 @@ impl MovieDatabase {
             .collect()
     }
 
+    fn search_by_cast(&self, query: &str) -> Vec<Movie> {
+        let query_lower = query.to_lowercase();
+        self.movies
+            .values()
+            .filter(|m| {
+                // Search in cast_details (newer, more detailed)
+                m.cast_details.iter().any(|c| c.name.to_lowercase().contains(&query_lower)) ||
+                // Also search in old cast list for backwards compatibility
+                m.cast.iter().any(|c| c.to_lowercase().contains(&query_lower))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn search_by_genre(&self, genre: &str) -> Vec<Movie> {
         if genre.is_empty() || genre == "All" {
             return self.list_all();
@@ -1369,6 +1383,10 @@ fn build_ui(app: &Application) {
     search_box.set_margin_top(12);
     search_box.set_margin_bottom(12);
 
+    let search_type_options = StringList::new(&["Search Title", "Search Cast"]);
+    let search_type_dropdown = DropDown::new(Some(search_type_options), None::<gtk::Expression>);
+    search_type_dropdown.set_selected(0);
+
     let search_entry = SearchEntry::new();
     search_entry.set_placeholder_text(Some("Search movies..."));
     search_entry.set_hexpand(true);
@@ -1381,6 +1399,7 @@ fn build_ui(app: &Application) {
     let sort_dropdown = DropDown::new(Some(sort_options), None::<gtk::Expression>);
     sort_dropdown.set_selected(0);
 
+    search_box.append(&search_type_dropdown);
     search_box.append(&search_entry);
     search_box.append(&Label::new(Some("Genre:")));
     search_box.append(&genre_dropdown);
@@ -1782,6 +1801,7 @@ fn build_ui(app: &Application) {
         is_grid_view: bool,
         db: &Rc<RefCell<MovieDatabase>>,
         search_query: &str,
+        search_type: &str,  // NEW: "Title" or "Cast"
         genre_filter: &str,
         sort_by: &str,
         poster_cache: &Rc<RefCell<HashMap<u32, Pixbuf>>>,
@@ -1795,7 +1815,7 @@ fn build_ui(app: &Application) {
         }
 
         // Create cache key from current filters
-        let cache_key = format!("{}|{}|{}", search_query, genre_filter, sort_by);
+        let cache_key = format!("{}|{}|{}|{}", search_query, search_type, genre_filter, sort_by);
         
         // Check cache first
         let results = if let Some(cached) = db.borrow().get_cached_results(&cache_key) {
@@ -1804,6 +1824,8 @@ fn build_ui(app: &Application) {
             // Cache miss - compute results
             let mut results = if search_query.is_empty() {
                 db.borrow().search_by_genre(genre_filter)
+            } else if search_type == "Search Cast" {
+                db.borrow().search_by_cast(search_query)
             } else {
                 db.borrow().search_by_title(search_query)
             };
@@ -1881,8 +1903,14 @@ fn build_ui(app: &Application) {
     let sort_dropdown_clone = sort_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
     let is_grid_view_clone = is_grid_view.clone();
+    let search_type_dropdown_clone = search_type_dropdown.clone();
     search_entry.connect_activate(move |entry| {
         let query = entry.text();
+        
+        let search_type_idx = search_type_dropdown_clone.selected();
+        let search_types = ["Search Title", "Search Cast"];
+        let search_type = search_types.get(search_type_idx as usize).unwrap_or(&"Search Title");
+        
         let selected_idx = genre_dropdown_clone.selected();
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
@@ -1892,7 +1920,7 @@ fn build_ui(app: &Application) {
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query.to_string(), selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query.to_string(), search_type, selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Genre filter
@@ -1900,6 +1928,7 @@ fn build_ui(app: &Application) {
     let grid_flow_clone = grid_flow.clone();
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
+    let search_type_dropdown_clone = search_type_dropdown.clone();
     let sort_dropdown_clone = sort_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
     let is_grid_view_clone = is_grid_view.clone();
@@ -1909,12 +1938,17 @@ fn build_ui(app: &Application) {
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
         let query = search_entry_clone.text().to_string();
+        
+        let search_type_idx = search_type_dropdown_clone.selected();
+        let search_types = ["Search Title", "Search Cast"];
+        let search_type = search_types.get(search_type_idx as usize).unwrap_or(&"Search Title");
+        
         let sort_idx = sort_dropdown_clone.selected();
         let sorts = ["Title (A-Z)", "Year (Newest)", "Year (Oldest)", "Rating (High-Low)", "Rating (Low-High)", "Date Added (Newest)", "Date Added (Oldest)"];
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, search_type, selected_genre, sort_by, &poster_cache_clone);
     });
     
     // Sort dropdown
@@ -1922,6 +1956,7 @@ fn build_ui(app: &Application) {
     let grid_flow_clone = grid_flow.clone();
     let db_clone = db.clone();
     let search_entry_clone = search_entry.clone();
+    let search_type_dropdown_clone = search_type_dropdown.clone();
     let genre_dropdown_clone = genre_dropdown.clone();
     let poster_cache_clone = poster_cache.clone();
     let is_grid_view_clone = is_grid_view.clone();
@@ -1931,12 +1966,17 @@ fn build_ui(app: &Application) {
         let sort_by = sorts.get(sort_idx as usize).unwrap_or(&"Title (A-Z)");
         
         let query = search_entry_clone.text().to_string();
+        
+        let search_type_idx = search_type_dropdown_clone.selected();
+        let search_types = ["Search Title", "Search Cast"];
+        let search_type = search_types.get(search_type_idx as usize).unwrap_or(&"Search Title");
+        
         let selected_idx = genre_dropdown_clone.selected();
         let genres = ["All", "Action", "Comedy", "Drama", "Film Noir", "Horror", "Sci-Fi", "Thriller", "Romance"];
         let selected_genre = genres.get(selected_idx as usize).unwrap_or(&"All");
         
         let is_grid = *is_grid_view_clone.borrow();
-        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, selected_genre, sort_by, &poster_cache_clone);
+        refresh_movie_list(&list_box_clone, &grid_flow_clone, is_grid, &db_clone, &query, search_type, selected_genre, sort_by, &poster_cache_clone);
     });
 
     // Movie selection
