@@ -1346,7 +1346,7 @@ fn build_ui(app: &Application) {
     let title_label = Label::new(Some("📽️ My MovieDB"));
     title_label.set_markup("<span size='x-large' weight='bold'>📽️ My MovieDB</span>");
     
-    let scan_button = Button::with_label("📁 Scan Directory");
+    let scan_button = Button::with_label("📁 Scan All");
     let add_button = Button::with_label("➕ Add Movie");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
     let refresh_all_button = Button::with_label("🔄 Refresh All");
@@ -1593,7 +1593,7 @@ fn build_ui(app: &Application) {
         
         // Version
         let version_label = gtk::Label::new(None);
-        version_label.set_markup("<span size='large'>Version 1.0.1</span>");
+        version_label.set_markup("<span size='large'>Version 1.0.2</span>");
         about_box.append(&version_label);
         
         // Description
@@ -2872,161 +2872,170 @@ fn build_ui(app: &Application) {
     });
 
     // Scan directory
-    let window_clone = window.clone();
     let db_clone = db.clone();
     let list_box_clone = list_box.clone();
     let status_bar_clone = status_bar.clone();
     let poster_cache_clone = poster_cache.clone();
     scan_button.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::new();
-        dialog.set_title("Select Movie Directory");
-
+        // Load configured scan directories from settings
+        let config = match load_config() {
+            Some(c) => c,
+            None => {
+                status_bar_clone.set_text("⚠️ No settings found. Please configure scan directories in Settings first.");
+                return;
+            }
+        };
+        
+        if config.scan_directories.is_empty() {
+            status_bar_clone.set_text("⚠️ No scan directories configured. Please add directories in Settings.");
+            return;
+        }
+        
+        status_bar_clone.set_text(&format!("Scanning {} configured director{}...", 
+            config.scan_directories.len(),
+            if config.scan_directories.len() == 1 { "y" } else { "ies" }
+        ));
+        
         let db_clone2 = db_clone.clone();
         let list_box_clone2 = list_box_clone.clone();
         let status_bar_clone2 = status_bar_clone.clone();
         let poster_cache_clone2 = poster_cache_clone.clone();
-        dialog.select_folder(Some(&window_clone), None::<&gtk::gio::Cancellable>, move |result| {
-            if let Ok(folder) = result {
-                if let Some(path) = folder.path() {
-                    let path_str = path.to_string_lossy().to_string();
-                    
-                    let db_clone3 = db_clone2.clone();
-                    let list_box_clone3 = list_box_clone2.clone();
-                    let status_bar_clone3 = status_bar_clone2.clone();
-                    
-                    // Create async channel
-                    let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
-                    
-                    // Get API key, posters_dir, year_cutoff, and existing paths before spawning thread (Rc can't be sent)
-                    let api_key = db_clone3.borrow().tmdb_api_key.clone();
-                    let posters_dir = db_clone3.borrow().posters_dir.clone();
-                    let year_cutoff = load_config().map(|c| c.year_cutoff).unwrap_or(1966);
-                    let existing_paths: std::collections::HashSet<String> = db_clone3.borrow()
-                        .movies
-                        .values()
-                        .map(|m| m.file_path.clone())
+        let scan_dirs = config.scan_directories.clone();
+        let year_cutoff = config.year_cutoff;
+        
+        // Create async channel
+        let (sender, receiver) = async_channel::unbounded::<(String, String, Option<Movie>)>();
+        
+        // Get API key, posters_dir, and existing paths before spawning thread
+        let api_key = db_clone2.borrow().tmdb_api_key.clone();
+        let posters_dir = db_clone2.borrow().posters_dir.clone();
+        let existing_paths: std::collections::HashSet<String> = db_clone2.borrow()
+            .movies
+            .values()
+            .map(|m| m.file_path.clone())
+            .collect();
+        
+        // Spawn background thread with async runtime
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            
+            runtime.block_on(async {
+                // Collect all video files from all configured directories
+                let mut files_to_process = Vec::new();
+                let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                
+                for scan_dir in &scan_dirs {
+                    let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {} ...", scan_dir), None));
+                    let path = Path::new(scan_dir);
+                    if path.exists() && path.is_dir() {
+                        scan_directory_recursive(path, &video_extensions, &mut files_to_process);
+                    } else {
+                        let _ = sender.send_blocking(("status".to_string(), format!("⚠️ Skipping invalid directory: {}", scan_dir), None));
+                    }
+                }
+                
+                // Filter out files that already exist in database
+                let new_files: Vec<_> = files_to_process.into_iter()
+                    .filter(|(_, file_path)| !existing_paths.contains(file_path))
+                    .collect();
+                
+                if new_files.is_empty() {
+                    let _ = sender.send_blocking(("status".to_string(), "No new movies found - all files already in database".to_string(), None));
+                    let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+                    return;
+                }
+                
+                let _ = sender.send_blocking(("status".to_string(), format!("Found {} new video files (skipped {} existing), fetching metadata in parallel...", new_files.len(), existing_paths.len()), None));
+                
+                // Process files in parallel batches of 10
+                let client = reqwest::Client::new();
+                let batch_size = 10;
+                
+                for batch in new_files.chunks(batch_size) {
+                    let futures: Vec<_> = batch.iter()
+                        .map(|(clean_title, file_path_str)| {
+                            let api_key = api_key.clone();
+                            let title = clean_title.clone();
+                            let file_path = file_path_str.clone();
+                            let client = client.clone();
+                            let sender = sender.clone();
+                            let posters_dir = posters_dir.clone();
+                            
+                            async move {
+                                let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
+                                
+                                match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir, year_cutoff).await {
+                                    Some(movie) => {
+                                        let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
+                                    }
+                                    None => {
+                                        let movie = Movie {
+                                            id: 0,
+                                            title: title.clone(),
+                                            year: 0,
+                                            director: String::from("Unknown"),
+                                            genre: vec![String::from("Uncategorized")],
+                                            rating: 0.0,
+                                            runtime: 0,
+                                            description: String::from("Metadata not found"),
+                                            cast: vec![],
+                                            cast_details: vec![],
+                                            file_path,
+                                            poster_url: String::new(),
+                                            tmdb_id: 0,
+                                            imdb_id: String::new(),
+                                            poster_path: String::new(),
+                                            watch_log: Vec::new(),
+                                        };
+                                        let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
+                                    }
+                                }
+                            }
+                        })
                         .collect();
                     
-                    // Spawn background thread with async runtime
-                    std::thread::spawn(move || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .unwrap();
-                        
-                        runtime.block_on(async {
-                            // Collect all video files recursively
-                            let mut files_to_process = Vec::new();
-                            let video_extensions = vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v"];
+                    futures::future::join_all(futures).await;
+                }
+                
+                let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
+            });
+        });
+        
+        // Handle messages on main thread using spawn_future_local
+        glib::spawn_future_local(async move {
+            while let Ok((msg_type, status, movie_opt)) = receiver.recv().await {
+                match msg_type.as_str() {
+                    "status" => {
+                        status_bar_clone2.set_text(&status);
+                    }
+                    "add" => {
+                        if let Some(movie) = movie_opt {
+                            // Check if movie already exists
+                            let exists = db_clone2.borrow().movies.values()
+                                .any(|m| m.file_path == movie.file_path);
                             
-                            let _ = sender.send_blocking(("status".to_string(), format!("Scanning: {} (including subdirectories)...", path_str), None));
-                            
-                            let path = Path::new(&path_str);
-                            scan_directory_recursive(path, &video_extensions, &mut files_to_process);
-                            
-                            // Filter out files that already exist in database (using pre-extracted paths)
-                            
-                            let new_files: Vec<_> = files_to_process.into_iter()
-                                .filter(|(_, file_path)| !existing_paths.contains(file_path))
-                                .collect();
-                            
-                            if new_files.is_empty() {
-                                let _ = sender.send_blocking(("status".to_string(), "No new movies found - all files already in database".to_string(), None));
-                                let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
-                                return;
-                            }
-                            
-                            let _ = sender.send_blocking(("status".to_string(), format!("Found {} new video files (skipped {} existing), fetching metadata in parallel...", new_files.len(), existing_paths.len()), None));
-                            
-                            // Process files in parallel batches of 10
-                            let client = reqwest::Client::new();
-                            let batch_size = 10;
-                            
-                            for batch in new_files.chunks(batch_size) {
-                                let futures: Vec<_> = batch.iter()
-                                    .map(|(clean_title, file_path_str)| {
-                                        let api_key = api_key.clone();
-                                        let title = clean_title.clone();
-                                        let file_path = file_path_str.clone();
-                                        let client = client.clone();
-                                        let sender = sender.clone();
-                                        let posters_dir = posters_dir.clone();
-                                        
-                                        async move {
-                                            let _ = sender.send_blocking(("status".to_string(), format!("Fetching: {}", title), None));
-                                            
-                                            match fetch_movie_metadata_async(&client, &api_key, &title, file_path.clone(), posters_dir, year_cutoff).await {
-                                                Some(movie) => {
-                                                    let _ = sender.send_blocking(("add".to_string(), format!("✓ Found: {}", title), Some(movie)));
-                                                }
-                                                None => {
-                                                    let movie = Movie {
-                                                        id: 0,
-                                                        title: title.clone(),
-                                                        year: 0,
-                                                        director: String::from("Unknown"),
-                                                        genre: vec![String::from("Uncategorized")],
-                                                        rating: 0.0,
-                                                        runtime: 0,
-                                                        description: String::from("Metadata not found"),
-                                                        cast: vec![],
-                                                        cast_details: vec![],
-                                                        file_path,
-                                                        poster_url: String::new(),
-                                                        tmdb_id: 0,
-                                                        imdb_id: String::new(),
-                                                        poster_path: String::new(),
-                                                        watch_log: Vec::new(),
-                                                    };
-                                                    let _ = sender.send_blocking(("add".to_string(), format!("⚠ Added without metadata: {}", title), Some(movie)));
-                                                }
-                                            }
-                                        }
-                                    })
-                                    .collect();
-                                
-                                futures::future::join_all(futures).await;
-                            }
-                            
-                            let _ = sender.send_blocking(("complete".to_string(), String::new(), None));
-                        });
-                    });
-                    
-                    // Handle messages on main thread using spawn_future_local
-                    glib::spawn_future_local(async move {
-                        while let Ok((msg_type, status, movie_opt)) = receiver.recv().await {
-                            match msg_type.as_str() {
-                                "status" => {
-                                    status_bar_clone3.set_text(&status);
-                                }
-                                "add" => {
-                                    if let Some(movie) = movie_opt {
-                                        // Check if movie already exists
-                                        let exists = db_clone3.borrow().movies.values()
-                                            .any(|m| m.file_path == movie.file_path);
-                                        
-                                        if !exists {
-                                            db_clone3.borrow_mut().add_movie(movie);
-                                        }
-                                    }
-                                    status_bar_clone3.set_text(&status);
-                                }
-                                "complete" => {
-                                    while let Some(child) = list_box_clone3.first_child() {
-                                        list_box_clone3.remove(&child);
-                                    }
-                                    let movies = db_clone3.borrow().list_all();
-                                    for movie in &movies {
-                                        let row = create_movie_row(movie, &poster_cache_clone2);
-                                        list_box_clone3.append(&row);
-                                    }
-                                    status_bar_clone3.set_text("Scan complete!");
-                                    break;
-                                }
-                                _ => {}
+                            if !exists {
+                                db_clone2.borrow_mut().add_movie(movie);
                             }
                         }
-                    });
+                        status_bar_clone2.set_text(&status);
+                    }
+                    "complete" => {
+                        while let Some(child) = list_box_clone2.first_child() {
+                            list_box_clone2.remove(&child);
+                        }
+                        let movies = db_clone2.borrow().list_all();
+                        for movie in &movies {
+                            let row = create_movie_row(movie, &poster_cache_clone2);
+                            list_box_clone2.append(&row);
+                        }
+                        status_bar_clone2.set_text("Scan complete!");
+                        break;
+                    }
+                    _ => {}
                 }
             }
         });

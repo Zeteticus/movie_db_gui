@@ -1,8 +1,8 @@
-# My MovieDB v1.0.1
+# My MovieDB v1.0.2
 
 A powerful GTK4-based movie collection manager with TMDB integration.
 
-![Version](https://img.shields.io/badge/version-1.0.1-blue)
+![Version](https://img.shields.io/badge/version-1.0.2-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 
 ## Features
@@ -117,9 +117,10 @@ A powerful GTK4-based movie collection manager with TMDB integration.
 └── cast_photos/        # Cast member photos
 ```
 
-## Version 1.0.1 Release Notes
+## Version 1.0.2 Release Notes
 
-Latest release with improved branding:
+Latest release with improved scanning workflow:
+- ⚡ Auto-scan configured directories (no more file picker!)
 - 🎨 Renamed to "My MovieDB"
 - ✨ TMDB integration with cast photos
 - 🔍 Dual search (title/cast)
