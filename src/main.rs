@@ -210,6 +210,8 @@ struct MovieDatabase {
     poster_cache: Rc<RefCell<HashMap<u32, Pixbuf>>>,  // movie_id -> cached pixbuf
     #[serde(skip)]  // Cache for search/filter/sort results
     result_cache: RefCell<HashMap<String, Vec<Movie>>>,  // cache_key -> filtered/sorted movies
+    #[serde(default)]
+    playlist: Vec<u32>,  // Movie IDs in watch order
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,6 +471,7 @@ impl MovieDatabase {
             tmdb_cache: HashMap::new(),
             poster_cache: Rc::new(RefCell::new(HashMap::new())),
             result_cache: RefCell::new(HashMap::new()),
+            playlist: Vec::new(),
         };
         db.load_from_file();
         db
@@ -775,6 +778,7 @@ fn create_movie_row_with_context(
         let menu_model = gtk::gio::Menu::new();
         menu_model.append(Some("▶️ Play in VLC"), Some("movie.play"));
         menu_model.append(Some("ℹ️ View Details"), Some("movie.details"));
+        menu_model.append(Some("📋 Add to Playlist"), Some("movie.playlist"));
         menu_model.append(Some("👁️ Mark as Unseen"), Some("movie.unseen"));
         menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
         
@@ -1107,6 +1111,30 @@ fn create_movie_row_with_context(
             menu_clone2.popdown();
         });
         
+        // Add to Playlist action
+        let playlist_action = gtk::gio::SimpleAction::new("playlist", None);
+        let db_clone5 = db_clone.clone();
+        let menu_clone4 = menu.clone();
+        let movie_title_clone3 = movie_title.clone();
+        playlist_action.connect_activate(move |_, _| {
+            let mut db_mut = db_clone5.borrow_mut();
+            
+            // Check if already in playlist
+            if db_mut.playlist.contains(&movie_id) {
+                eprintln!("Movie already in playlist: {}", movie_title_clone3);
+            } else {
+                db_mut.playlist.push(movie_id);
+                eprintln!("Added to playlist: {}", movie_title_clone3);
+                
+                // Save database
+                if let Err(e) = db_mut.save_to_file() {
+                    eprintln!("Warning: Failed to save database: {}", e);
+                }
+            }
+            
+            menu_clone4.popdown();
+        });
+        
         // Mark as Unseen action
         let unseen_action = gtk::gio::SimpleAction::new("unseen", None);
         let db_clone4 = db_clone.clone();
@@ -1147,6 +1175,7 @@ fn create_movie_row_with_context(
         
         actions.add_action(&play_action);
         actions.add_action(&details_action);
+        actions.add_action(&playlist_action);
         actions.add_action(&unseen_action);
         actions.add_action(&delete_action);
         menu.insert_action_group("movie", Some(&actions));
@@ -1386,6 +1415,106 @@ fn build_ui(app: &Application) {
     let title_label = Label::new(Some("📽️ My MovieDB"));
     title_label.set_markup("<span size='x-large' weight='bold'>📽️ My MovieDB</span>");
     
+    // Add right-click to title label to show About dialog
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(3); // Right-click
+    let window_clone_for_title = window.clone();
+    gesture.connect_released(move |_, _, _, _| {
+        // Show About dialog (same as Help button)
+        let about_dialog = gtk::Window::builder()
+            .title("About My MovieDB")
+            .modal(true)
+            .transient_for(&window_clone_for_title)
+            .default_width(500)
+            .default_height(400)
+            .build();
+        
+        let about_box = gtk::Box::new(gtk::Orientation::Vertical, 20);
+        about_box.set_margin_start(40);
+        about_box.set_margin_end(40);
+        about_box.set_margin_top(40);
+        about_box.set_margin_bottom(40);
+        about_box.set_halign(gtk::Align::Center);
+        
+        // App name
+        let name_label = gtk::Label::new(None);
+        name_label.set_markup("<span size='xx-large' weight='bold'>My MovieDB</span>");
+        about_box.append(&name_label);
+        
+        // Version
+        let version_label = gtk::Label::new(None);
+        version_label.set_markup("<span size='large'>Version 1.0.2</span>");
+        about_box.append(&version_label);
+        
+        // Description
+        let desc_label = gtk::Label::new(None);
+        desc_label.set_markup("<span size='medium'>A movie collection manager with TMDB integration</span>");
+        desc_label.set_wrap(true);
+        desc_label.set_justify(gtk::Justification::Center);
+        about_box.append(&desc_label);
+        
+        // Separator
+        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        
+        // Features
+        let features_label = gtk::Label::new(None);
+        features_label.set_markup(
+            "<b>Features:</b>\n\
+            • TMDB metadata integration\n\
+            • HD poster downloads\n\
+            • Cast photos and details\n\
+            • Watch history tracking\n\
+            • Search by title or cast member\n\
+            • Multiple views (list/grid)\n\
+            • Year filtering\n\
+            • VLC integration\n\
+            • Playlist management"
+        );
+        features_label.set_xalign(0.0);
+        about_box.append(&features_label);
+        
+        // Separator
+        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        
+        // Keyboard shortcuts
+        let shortcuts_label = gtk::Label::new(None);
+        shortcuts_label.set_markup(
+            "<b>Keyboard Shortcuts:</b>\n\
+            • Ctrl+F - Focus search\n\
+            • Space - Play selected movie\n\
+            • Delete - Delete movie metadata\n\
+            • Escape - Close dialogs"
+        );
+        shortcuts_label.set_xalign(0.0);
+        about_box.append(&shortcuts_label);
+        
+        // Close button
+        let close_btn = gtk::Button::with_label("Close");
+        close_btn.set_halign(gtk::Align::Center);
+        close_btn.set_margin_top(20);
+        let dialog_clone = about_dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_clone.close();
+        });
+        about_box.append(&close_btn);
+        
+        // Add Escape key handler
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = about_dialog.clone();
+        key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
+            if key == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        about_dialog.add_controller(key_controller);
+        
+        about_dialog.set_child(Some(&about_box));
+        about_dialog.present();
+    });
+    title_label.add_controller(gesture);
+    
     let scan_button = Button::with_label("📁 Scan All");
     let refresh_button = Button::with_label("🔄 Refresh Metadata");
     let refresh_all_button = Button::with_label("🔄 Refresh All");
@@ -1395,14 +1524,15 @@ fn build_ui(app: &Application) {
     let edit_button = Button::with_label("✏️ Edit Metadata");
     let select_version_button = Button::with_label("🎞️ Wrong Movie?");
     let stats_button = Button::with_label("📊 Statistics");
+    let playlist_button = Button::with_label("📋 Playlist");
+    playlist_button.set_tooltip_text(Some("View and manage your playlist"));
     let settings_button = Button::with_label("⚙️ Settings");
-    let help_button = Button::with_label("❓ Help");
     
     header.append(&title_label);
     header.append(&Box::new(Orientation::Horizontal, 0));
     header.set_hexpand(true);
     title_label.set_hexpand(true);
-    header.append(&help_button);
+    header.append(&playlist_button);
     header.append(&stats_button);
     header.append(&settings_button);
     header.append(&clean_button);
@@ -1607,101 +1737,6 @@ fn build_ui(app: &Application) {
             button.set_label("📋 List");
             scrolled_clone.set_child(Some(&list_box_clone_toggle));
         }
-    });
-
-    // Help button - show About dialog
-    let window_clone = window.clone();
-    help_button.connect_clicked(move |_| {
-        let about_dialog = gtk::Window::builder()
-            .title("About My MovieDB")
-            .modal(true)
-            .transient_for(&window_clone)
-            .default_width(500)
-            .default_height(400)
-            .build();
-        
-        let about_box = gtk::Box::new(gtk::Orientation::Vertical, 20);
-        about_box.set_margin_start(40);
-        about_box.set_margin_end(40);
-        about_box.set_margin_top(40);
-        about_box.set_margin_bottom(40);
-        about_box.set_halign(gtk::Align::Center);
-        
-        // App name
-        let name_label = gtk::Label::new(None);
-        name_label.set_markup("<span size='xx-large' weight='bold'>My MovieDB</span>");
-        about_box.append(&name_label);
-        
-        // Version
-        let version_label = gtk::Label::new(None);
-        version_label.set_markup("<span size='large'>Version 1.0.2</span>");
-        about_box.append(&version_label);
-        
-        // Description
-        let desc_label = gtk::Label::new(None);
-        desc_label.set_markup("<span size='medium'>A movie collection manager with TMDB integration</span>");
-        desc_label.set_wrap(true);
-        desc_label.set_justify(gtk::Justification::Center);
-        about_box.append(&desc_label);
-        
-        // Separator
-        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        
-        // Features
-        let features_label = gtk::Label::new(None);
-        features_label.set_markup(
-            "<b>Features:</b>\n\
-            • TMDB metadata integration\n\
-            • HD poster downloads\n\
-            • Cast photos and details\n\
-            • Watch history tracking\n\
-            • Search by title or cast member\n\
-            • Multiple views (list/grid)\n\
-            • Year filtering\n\
-            • VLC integration"
-        );
-        features_label.set_xalign(0.0);
-        about_box.append(&features_label);
-        
-        // Separator
-        about_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-        
-        // Keyboard shortcuts
-        let shortcuts_label = gtk::Label::new(None);
-        shortcuts_label.set_markup(
-            "<b>Keyboard Shortcuts:</b>\n\
-            • Ctrl+F - Focus search\n\
-            • Space - Play selected movie\n\
-            • Delete - Delete movie metadata\n\
-            • Escape - Close dialogs"
-        );
-        shortcuts_label.set_xalign(0.0);
-        about_box.append(&shortcuts_label);
-        
-        // Close button
-        let close_btn = gtk::Button::with_label("Close");
-        close_btn.set_halign(gtk::Align::Center);
-        close_btn.set_margin_top(20);
-        let dialog_clone = about_dialog.clone();
-        close_btn.connect_clicked(move |_| {
-            dialog_clone.close();
-        });
-        about_box.append(&close_btn);
-        
-        // Add Escape key handler
-        let key_controller = gtk::EventControllerKey::new();
-        let dialog_for_escape = about_dialog.clone();
-        key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
-            if key == gtk::gdk::Key::Escape {
-                dialog_for_escape.close();
-                return gtk::glib::Propagation::Stop;
-            }
-            gtk::glib::Propagation::Proceed
-        });
-        about_dialog.add_controller(key_controller);
-        
-        about_dialog.set_child(Some(&about_box));
-        about_dialog.present();
     });
 
     // Show window first for fast startup
@@ -4428,6 +4463,138 @@ fn build_ui(app: &Application) {
         });
 
         dialog.present();
+    });
+
+    // Playlist button - view and manage playlist
+    let window_clone = window.clone();
+    let db_clone = db.clone();
+    playlist_button.connect_clicked(move |_| {
+        let playlist_dialog = gtk::Window::builder()
+            .title("Playlist - Movies to Watch")
+            .modal(true)
+            .transient_for(&window_clone)
+            .default_width(600)
+            .default_height(500)
+            .build();
+        
+        let dialog_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        dialog_box.set_margin_start(20);
+        dialog_box.set_margin_end(20);
+        dialog_box.set_margin_top(20);
+        dialog_box.set_margin_bottom(20);
+        
+        let header = gtk::Label::new(None);
+        let db_borrow = db_clone.borrow();
+        let count = db_borrow.playlist.len();
+        header.set_markup(&format!("<span size='large' weight='bold'>📋 Playlist ({} movie{})</span>", 
+            count, if count == 1 { "" } else { "s" }));
+        dialog_box.append(&header);
+        
+        let scroll = gtk::ScrolledWindow::new();
+        scroll.set_vexpand(true);
+        scroll.set_hexpand(true);
+        
+        let playlist_list = gtk::ListBox::new();
+        playlist_list.set_selection_mode(gtk::SelectionMode::None);
+        scroll.set_child(Some(&playlist_list));
+        dialog_box.append(&scroll);
+        
+        // Populate playlist
+        for movie_id in &db_borrow.playlist {
+            if let Some(movie) = db_borrow.movies.get(movie_id) {
+                let row = gtk::ListBoxRow::new();
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                row_box.set_margin_start(12);
+                row_box.set_margin_end(12);
+                row_box.set_margin_top(8);
+                row_box.set_margin_bottom(8);
+                
+                // Movie info
+                let info_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                info_box.set_hexpand(true);
+                
+                let title_label = gtk::Label::new(None);
+                title_label.set_markup(&format!("<b>{}</b> ({})", escape_markup(&movie.title), movie.year));
+                title_label.set_xalign(0.0);
+                info_box.append(&title_label);
+                
+                let details_label = gtk::Label::new(Some(&format!("{} • ⭐ {:.1}", movie.genre.join(", "), movie.rating)));
+                details_label.set_xalign(0.0);
+                info_box.append(&details_label);
+                
+                row_box.append(&info_box);
+                
+                // Remove button
+                let remove_btn = gtk::Button::with_label("Remove");
+                let db_clone2 = db_clone.clone();
+                let playlist_list_clone = playlist_list.clone();
+                let row_clone = row.clone();
+                let movie_id_copy = *movie_id;
+                remove_btn.connect_clicked(move |_| {
+                    let mut db_mut = db_clone2.borrow_mut();
+                    db_mut.playlist.retain(|&id| id != movie_id_copy);
+                    if let Err(e) = db_mut.save_to_file() {
+                        eprintln!("Warning: Failed to save database: {}", e);
+                    }
+                    drop(db_mut);
+                    playlist_list_clone.remove(&row_clone);
+                });
+                row_box.append(&remove_btn);
+                
+                row.set_child(Some(&row_box));
+                playlist_list.append(&row);
+            }
+        }
+        drop(db_borrow);
+        
+        if count == 0 {
+            let empty_label = gtk::Label::new(Some("No movies in playlist.\n\nRight-click any movie and select \"Add to Playlist\" to add it here."));
+            empty_label.set_margin_top(50);
+            empty_label.set_margin_bottom(50);
+            dialog_box.append(&empty_label);
+        }
+        
+        // Button box
+        let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        button_box.set_halign(gtk::Align::End);
+        button_box.set_margin_top(12);
+        
+        let clear_btn = gtk::Button::with_label("Clear All");
+        let db_clone2 = db_clone.clone();
+        let dialog_clone = playlist_dialog.clone();
+        clear_btn.connect_clicked(move |_| {
+            let mut db_mut = db_clone2.borrow_mut();
+            db_mut.playlist.clear();
+            if let Err(e) = db_mut.save_to_file() {
+                eprintln!("Warning: Failed to save database: {}", e);
+            }
+            drop(db_mut);
+            dialog_clone.close();
+        });
+        button_box.append(&clear_btn);
+        
+        let close_btn = gtk::Button::with_label("Close");
+        let dialog_clone2 = playlist_dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_clone2.close();
+        });
+        button_box.append(&close_btn);
+        dialog_box.append(&button_box);
+        
+        // Escape key to close
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = playlist_dialog.clone();
+        key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
+            if key == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        playlist_dialog.add_controller(key_controller);
+        
+        playlist_dialog.set_child(Some(&dialog_box));
+        playlist_dialog.present();
     });
 
     
