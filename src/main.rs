@@ -773,12 +773,14 @@ fn create_movie_row_with_context(
     let movie_title = movie.title.clone();
     let db_clone = db.clone();
     let row_clone = row.clone();
+    let poster_cache_clone = poster_cache.clone();
     
     gesture.connect_released(move |_, _, x, y| {
         let menu_model = gtk::gio::Menu::new();
         menu_model.append(Some("▶️ Play in VLC"), Some("movie.play"));
         menu_model.append(Some("ℹ️ View Details"), Some("movie.details"));
         menu_model.append(Some("📋 Add to Playlist"), Some("movie.playlist"));
+        menu_model.append(Some("✅ Mark as Seen"), Some("movie.seen"));
         menu_model.append(Some("👁️ Mark as Unseen"), Some("movie.unseen"));
         menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
         
@@ -1135,18 +1137,33 @@ fn create_movie_row_with_context(
             menu_clone4.popdown();
         });
         
-        // Mark as Unseen action
-        let unseen_action = gtk::gio::SimpleAction::new("unseen", None);
-        let db_clone4 = db_clone.clone();
-        let menu_clone3 = menu.clone();
-        let row_clone3 = row_clone.clone();
-        unseen_action.connect_activate(move |_, _| {
-            // Clear watch log to mark as unseen
-            let mut db_mut = db_clone4.borrow_mut();
+        // Mark as Seen action
+        let seen_action = gtk::gio::SimpleAction::new("seen", None);
+        let db_clone6 = db_clone.clone();
+        let menu_clone5 = menu.clone();
+        let movie_title_clone4 = movie_title.clone();
+        let row_clone4 = row_clone.clone();
+        let poster_cache_clone_seen = poster_cache_clone.clone();
+        seen_action.connect_activate(move |_, _| {
+            let mut db_mut = db_clone6.borrow_mut();
             if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
-                if !movie.watch_log.is_empty() {
-                    movie.watch_log.clear();
-                    eprintln!("Marked movie as unseen: {}", movie.title);
+                // Add a watch entry with today's date if not already watched
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                
+                // Check if already watched today
+                let already_logged_today = movie.watch_log.iter()
+                    .any(|entry| entry.date == today);
+                
+                if !already_logged_today {
+                    movie.watch_log.push(WatchLogEntry {
+                        date: today,
+                        rating: None,
+                        comments: String::from("Marked as watched"),
+                    });
+                    eprintln!("Marked as seen: {}", movie_title_clone4);
+                    
+                    // Clone movie before releasing the mutable borrow
+                    let updated_movie = movie.clone();
                     
                     // Save database
                     if let Err(e) = db_mut.save_to_file() {
@@ -1155,15 +1172,63 @@ fn create_movie_row_with_context(
                     
                     drop(db_mut);
                     
-                    // Update UI - remove SEEN badge by recreating the row
+                    // Recreate row with SEEN badge
+                    if let Some(parent) = row_clone4.parent() {
+                        if let Some(list_box) = parent.downcast_ref::<ListBox>() {
+                            // Get the row's index
+                            let index = row_clone4.index();
+                            
+                            // Remove old row
+                            list_box.remove(&row_clone4);
+                            
+                            // Create new row with badge
+                            let new_row = create_movie_row(&updated_movie, &poster_cache_clone_seen);
+                            list_box.insert(&new_row, index);
+                        }
+                    }
+                } else {
+                    eprintln!("Movie already marked as seen today: {}", movie_title_clone4);
+                }
+            }
+            menu_clone5.popdown();
+        });
+        
+        // Mark as Unseen action
+        let unseen_action = gtk::gio::SimpleAction::new("unseen", None);
+        let db_clone4 = db_clone.clone();
+        let menu_clone3 = menu.clone();
+        let row_clone3 = row_clone.clone();
+        let poster_cache_clone_unseen = poster_cache_clone.clone();
+        unseen_action.connect_activate(move |_, _| {
+            // Clear watch log to mark as unseen
+            let mut db_mut = db_clone4.borrow_mut();
+            if let Some(movie) = db_mut.movies.get_mut(&movie_id) {
+                if !movie.watch_log.is_empty() {
+                    movie.watch_log.clear();
+                    eprintln!("Marked movie as unseen: {}", movie.title);
+                    
+                    // Clone movie before releasing the mutable borrow
+                    let updated_movie = movie.clone();
+                    
+                    // Save database
+                    if let Err(e) = db_mut.save_to_file() {
+                        eprintln!("Warning: Failed to save database: {}", e);
+                    }
+                    
+                    drop(db_mut);
+                    
+                    // Recreate row without SEEN badge
                     if let Some(parent) = row_clone3.parent() {
                         if let Some(list_box) = parent.downcast_ref::<ListBox>() {
+                            // Get the row's index
+                            let index = row_clone3.index();
+                            
                             // Remove old row
                             list_box.remove(&row_clone3);
                             
-                            // Note: The badge will be removed on next refresh
-                            // For immediate update, we'd need to rebuild the row, but that's complex
-                            // User can refresh view or the change will show on next startup
+                            // Create new row without badge
+                            let new_row = create_movie_row(&updated_movie, &poster_cache_clone_unseen);
+                            list_box.insert(&new_row, index);
                         }
                     }
                 } else {
@@ -1176,6 +1241,7 @@ fn create_movie_row_with_context(
         actions.add_action(&play_action);
         actions.add_action(&details_action);
         actions.add_action(&playlist_action);
+        actions.add_action(&seen_action);
         actions.add_action(&unseen_action);
         actions.add_action(&delete_action);
         menu.insert_action_group("movie", Some(&actions));
