@@ -783,6 +783,7 @@ fn create_movie_row_with_context(
         menu_model.append(Some("✅ Mark as Seen"), Some("movie.seen"));
         menu_model.append(Some("👁️ Mark as Unseen"), Some("movie.unseen"));
         menu_model.append(Some("🗑️ Delete Movie Metadata"), Some("movie.delete"));
+        menu_model.append(Some("❌ Delete Movie"), Some("movie.deletefile"));
         
         let menu = gtk::PopoverMenu::from_model(Some(&menu_model));
         menu.set_parent(&row_clone);
@@ -1113,6 +1114,60 @@ fn create_movie_row_with_context(
             menu_clone2.popdown();
         });
         
+        // Delete Movie (file + metadata) action
+        let deletefile_action = gtk::gio::SimpleAction::new("deletefile", None);
+        let db_clone7 = db_clone.clone();
+        let menu_clone6 = menu.clone();
+        let movie_title_clone5 = movie_title.clone();
+        let file_path_clone2 = file_path.clone();
+        let row_clone5 = row_clone.clone();
+        deletefile_action.connect_activate(move |_, _| {
+            // Show confirmation dialog
+            let dialog = gtk::AlertDialog::builder()
+                .message("Delete Movie File")
+                .detail(&format!("⚠️ WARNING: This will permanently delete:\n\n• Movie file: {}\n• All metadata (poster, cast, watch history)\n\nThis action CANNOT be undone!\n\nContinue?", file_path_clone2))
+                .buttons(vec!["Cancel", "Delete Movie"])
+                .cancel_button(0)
+                .default_button(0) // Default to Cancel for safety
+                .build();
+            
+            let db_clone_inner = db_clone7.clone();
+            let row_clone_inner = row_clone5.clone();
+            let file_path_inner = file_path_clone2.clone();
+            let movie_title_inner = movie_title_clone5.clone();
+            
+            dialog.choose(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, move |response| {
+                if let Ok(1) = response {
+                    // Delete the actual file
+                    if std::path::Path::new(&file_path_inner).exists() {
+                        if let Err(e) = std::fs::remove_file(&file_path_inner) {
+                            eprintln!("Failed to delete file {}: {}", file_path_inner, e);
+                            return;
+                        }
+                        eprintln!("Deleted movie file: {}", file_path_inner);
+                    }
+                    
+                    // Delete the metadata from database
+                    let mut db_mut = db_clone_inner.borrow_mut();
+                    if db_mut.delete_movie(movie_id) {
+                        eprintln!("Deleted movie metadata: {}", movie_title_inner);
+                        drop(db_mut);
+                        
+                        // Remove the row from UI
+                        if let Some(parent) = row_clone_inner.parent() {
+                            if let Some(list_box) = parent.downcast_ref::<ListBox>() {
+                                list_box.remove(&row_clone_inner);
+                            }
+                        }
+                    } else {
+                        eprintln!("Failed to delete movie metadata - not found");
+                    }
+                }
+            });
+            
+            menu_clone6.popdown();
+        });
+        
         // Add to Playlist action
         let playlist_action = gtk::gio::SimpleAction::new("playlist", None);
         let db_clone5 = db_clone.clone();
@@ -1244,6 +1299,7 @@ fn create_movie_row_with_context(
         actions.add_action(&seen_action);
         actions.add_action(&unseen_action);
         actions.add_action(&delete_action);
+        actions.add_action(&deletefile_action);
         menu.insert_action_group("movie", Some(&actions));
         
         menu.popup();
