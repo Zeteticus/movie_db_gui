@@ -872,7 +872,15 @@ fn create_movie_row_with_context(
         let details_action = gtk::gio::SimpleAction::new("details", None);
         let db_clone2 = db_clone.clone();
         let menu_clone_details = menu.clone();
+        let row_clone_details = row_clone.clone();
         details_action.connect_activate(move |_, _| {
+            // Get window from row's root
+            let window_clone = if let Some(root) = row_clone_details.root() {
+                root.downcast::<gtk::Window>().ok()
+            } else {
+                None
+            };
+            
             let db = db_clone2.borrow();
             if let Some(movie) = db.movies.get(&movie_id) {
                 // Create details dialog
@@ -882,6 +890,11 @@ fn create_movie_row_with_context(
                     .default_width(700)
                     .default_height(600)
                     .build();
+                
+                // Set parent window if available
+                if let Some(parent) = &window_clone {
+                    details_dialog.set_transient_for(Some(parent));
+                }
                 
                 let scroll = gtk::ScrolledWindow::new();
                 scroll.set_vexpand(true);
@@ -973,7 +986,7 @@ fn create_movie_row_with_context(
                 // Cast photos section (if available)
                 if !movie.cast_details.is_empty() {
                     let cast_label = gtk::Label::new(None);
-                    cast_label.set_markup("<b>Cast Photos:</b>");
+                    cast_label.set_markup("<b>Cast Photos:</b> (click to see all movies)");
                     cast_label.set_xalign(0.0);
                     cast_label.set_margin_top(12);
                     details_box.append(&cast_label);
@@ -987,6 +1000,10 @@ fn create_movie_row_with_context(
                     cast_flow.set_max_children_per_line(4);
                     
                     for cast_member in &movie.cast_details {
+                        // Make entire cast member a clickable button
+                        let member_button = gtk::Button::new();
+                        member_button.set_has_frame(false);
+                        
                         let member_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
                         member_box.set_size_request(120, 200);
                         
@@ -1047,7 +1064,200 @@ fn create_movie_row_with_context(
                             member_box.append(&char_label);
                         }
                         
-                        cast_flow.append(&member_box);
+                        member_button.set_child(Some(&member_box));
+                        
+                        // Click handler to show all movies with this actor
+                        let actor_name = cast_member.name.clone();
+                        let db_clone_cast = db_clone2.clone();
+                        let window_clone_cast = window_clone.clone();
+                        member_button.connect_clicked(move |_| {
+                            // Search for all movies with this actor
+                            let db_borrow = db_clone_cast.borrow();
+                            let actor_movies: Vec<Movie> = db_borrow.movies.values()
+                                .filter(|m| {
+                                    m.cast_details.iter().any(|c| c.name == actor_name) ||
+                                    m.cast.iter().any(|c| c == &actor_name)
+                                })
+                                .cloned()
+                                .collect();
+                            drop(db_borrow);
+                            
+                            // Show dialog with results
+                            let mut results_builder = gtk::Window::builder()
+                                .title(&format!("Movies with {}", actor_name))
+                                .modal(true)
+                                .default_width(500)
+                                .default_height(400);
+                            
+                            // Set parent if available
+                            if let Some(ref parent) = window_clone_cast {
+                                results_builder = results_builder.transient_for(parent);
+                            }
+                            
+                            let results_dialog = results_builder.build();
+                            
+                            let results_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+                            results_box.set_margin_start(20);
+                            results_box.set_margin_end(20);
+                            results_box.set_margin_top(20);
+                            results_box.set_margin_bottom(20);
+                            
+                            let header = gtk::Label::new(None);
+                            header.set_markup(&format!("<span size='large' weight='bold'>🎬 {} ({} movie{})</span>", 
+                                escape_markup(&actor_name), 
+                                actor_movies.len(),
+                                if actor_movies.len() == 1 { "" } else { "s" }
+                            ));
+                            results_box.append(&header);
+                            
+                            let scroll = gtk::ScrolledWindow::new();
+                            scroll.set_vexpand(true);
+                            scroll.set_hexpand(true);
+                            
+                            let movies_list = gtk::ListBox::new();
+                            movies_list.set_selection_mode(gtk::SelectionMode::None);
+                            scroll.set_child(Some(&movies_list));
+                            results_box.append(&scroll);
+                            
+                            // Populate with movies
+                            for m in &actor_movies {
+                                let row = gtk::ListBoxRow::new();
+                                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                                row_box.set_margin_start(12);
+                                row_box.set_margin_end(12);
+                                row_box.set_margin_top(8);
+                                row_box.set_margin_bottom(8);
+                                
+                                let info_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                                info_box.set_hexpand(true);
+                                
+                                let title = gtk::Label::new(None);
+                                title.set_markup(&format!("<b>{}</b> ({})", escape_markup(&m.title), m.year));
+                                title.set_xalign(0.0);
+                                info_box.append(&title);
+                                
+                                // Show character name if available
+                                if let Some(cast_detail) = m.cast_details.iter().find(|c| c.name == actor_name) {
+                                    if !cast_detail.character.is_empty() {
+                                        let char_label = gtk::Label::new(None);
+                                        char_label.set_markup(&format!("<i>as {}</i>", escape_markup(&cast_detail.character)));
+                                        char_label.set_xalign(0.0);
+                                        info_box.append(&char_label);
+                                    }
+                                }
+                                
+                                let details = gtk::Label::new(Some(&format!("{} • ⭐ {:.1}", m.genre.join(", "), m.rating)));
+                                details.set_xalign(0.0);
+                                info_box.append(&details);
+                                
+                                row_box.append(&info_box);
+                                
+                                // Add play button
+                                let play_btn = gtk::Button::with_label("▶️ Play");
+                                let file_path = m.file_path.clone();
+                                let movie_title_play = m.title.clone();
+                                let db_clone_play = db_clone_cast.clone();
+                                let movie_id_play = m.id;
+                                play_btn.connect_clicked(move |_| {
+                                    if !file_path.is_empty() && std::path::Path::new(&file_path).exists() {
+                                        match std::process::Command::new("vlc")
+                                            .arg(&file_path)
+                                            .stdout(std::process::Stdio::null())
+                                            .stderr(std::process::Stdio::null())
+                                            .spawn()
+                                        {
+                                            Ok(_) => {
+                                                eprintln!("Playing: {}", movie_title_play);
+                                                
+                                                // Auto-log to watch history
+                                                if let Ok(mut db_mut) = db_clone_play.try_borrow_mut() {
+                                                    if let Some(movie) = db_mut.movies.get_mut(&movie_id_play) {
+                                                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                                        let entry = WatchLogEntry {
+                                                            date: today,
+                                                            rating: None,
+                                                            comments: String::from("Watched"),
+                                                        };
+                                                        movie.watch_log.push(entry);
+                                                    }
+                                                    if let Err(e) = db_mut.save_to_file() {
+                                                        eprintln!("Warning: Failed to save watch log: {}", e);
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                // Try flatpak VLC
+                                                match std::process::Command::new("flatpak")
+                                                    .args(["run", "org.videolan.VLC", &file_path])
+                                                    .stdout(std::process::Stdio::null())
+                                                    .stderr(std::process::Stdio::null())
+                                                    .spawn()
+                                                {
+                                                    Ok(_) => {
+                                                        eprintln!("Playing: {}", movie_title_play);
+                                                        
+                                                        // Auto-log to watch history
+                                                        if let Ok(mut db_mut) = db_clone_play.try_borrow_mut() {
+                                                            if let Some(movie) = db_mut.movies.get_mut(&movie_id_play) {
+                                                                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                                                                let entry = WatchLogEntry {
+                                                                    date: today,
+                                                                    rating: None,
+                                                                    comments: String::from("Watched"),
+                                                                };
+                                                                movie.watch_log.push(entry);
+                                                            }
+                                                            if let Err(e) = db_mut.save_to_file() {
+                                                                eprintln!("Warning: Failed to save watch log: {}", e);
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("Failed to launch VLC: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!("File not found: {}", file_path);
+                                    }
+                                });
+                                row_box.append(&play_btn);
+                                
+                                row.set_child(Some(&row_box));
+                                movies_list.append(&row);
+                            }
+                            
+                            // Close button
+                            let button_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                            button_box.set_halign(gtk::Align::End);
+                            button_box.set_margin_top(12);
+                            
+                            let close_btn = gtk::Button::with_label("Close");
+                            let results_dialog_clone = results_dialog.clone();
+                            close_btn.connect_clicked(move |_| {
+                                results_dialog_clone.close();
+                            });
+                            button_box.append(&close_btn);
+                            results_box.append(&button_box);
+                            
+                            // Escape key handler
+                            let key_controller = gtk::EventControllerKey::new();
+                            let dialog_for_escape = results_dialog.clone();
+                            key_controller.connect_key_pressed(move |_, key, _code, _modifier| {
+                                if key == gtk::gdk::Key::Escape {
+                                    dialog_for_escape.close();
+                                    return gtk::glib::Propagation::Stop;
+                                }
+                                gtk::glib::Propagation::Proceed
+                            });
+                            results_dialog.add_controller(key_controller);
+                            
+                            results_dialog.set_child(Some(&results_box));
+                            results_dialog.present();
+                        });
+                        
+                        cast_flow.append(&member_button);
                     }
                     
                     details_box.append(&cast_flow);
